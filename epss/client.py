@@ -9,7 +9,10 @@ from typing import Any, Iterable, Iterator, Optional, Tuple, Union
 
 import requests
 from epss import util
-from epss.constants import DEFAULT_FILE_FORMAT, TIME, V1_RELEASE_DATE, V2_RELEASE_DATE, V3_RELEASE_DATE
+from epss.constants import (
+    DEFAULT_FILE_FORMAT, TIME, V1_RELEASE_DATE, V2_RELEASE_DATE, 
+    V3_RELEASE_DATE, V4_RELEASE_DATE, DEFAULT_DOWNLOAD_URL_BASE
+)
 import polars as pl
 import concurrent.futures
 
@@ -63,6 +66,8 @@ class BaseClient(ClientInterface):
     include_v1_scores: bool = False
     include_v2_scores: bool = False
     include_v3_scores: bool = True
+    include_v4_scores: bool = False
+    download_url_base: str = DEFAULT_DOWNLOAD_URL_BASE
 
     @property
     def min_date(self) -> datetime.date:
@@ -84,6 +89,7 @@ class BaseClient(ClientInterface):
             include_v1_scores=self.include_v1_scores,
             include_v2_scores=self.include_v2_scores,
             include_v3_scores=self.include_v3_scores,
+            include_v4_scores=self.include_v4_scores,
         )
 
     def get_max_date(self) -> datetime.date:
@@ -94,7 +100,9 @@ class BaseClient(ClientInterface):
             include_v1_scores=self.include_v1_scores,
             include_v2_scores=self.include_v2_scores,
             include_v3_scores=self.include_v3_scores,
+            include_v4_scores=self.include_v4_scores,
             verify_tls=self.verify_tls,
+            download_url_base=self.download_url_base,
         )
     
     def get_date_range(self, min_date: Optional[TIME] = None, max_date: Optional[TIME] = None) -> Tuple[datetime.date, datetime.date]:
@@ -174,7 +182,7 @@ class BaseClient(ClientInterface):
             logger.debug("Scores for %s have already been downloaded: %s", date.isoformat(), path)
             return
         
-        url = get_download_url(date, verify_tls=self.verify_tls)
+        url = get_download_url(date, verify_tls=self.verify_tls, download_url_base=self.download_url_base)
         logger.debug('Downloading scores for %s: %s -> %s', date.isoformat(), url, path)
 
         response = requests.get(url, verify=self.verify_tls, stream=True)
@@ -296,7 +304,7 @@ class PolarsClient(BaseClient):
         
         min_date, max_date = self.get_date_range(min_date, max_date)
         for date in self.iter_dates(min_date, max_date):
-            yield get_download_url(date, verify_tls=self.verify_tls)
+            yield get_download_url(date, verify_tls=self.verify_tls, download_url_base=self.download_url_base)
 
 
 def get_file_path(workdir: str, file_format: str, key: Union[datetime.date, str]) -> str:
@@ -314,7 +322,10 @@ def get_file_path(workdir: str, file_format: str, key: Union[datetime.date, str]
     return os.path.join(workdir, f'{key}.{file_format}')
 
 
-def get_download_url(date: Optional[TIME] = None, verify_tls: bool = True) -> str:
+def get_download_url(
+        date: Optional[TIME] = None, 
+        verify_tls: bool = True, 
+        download_url_base: str = DEFAULT_DOWNLOAD_URL_BASE) -> str:
     """
     Returns the URL for downloading EPSS scores for the specified date.
     
@@ -324,16 +335,22 @@ def get_download_url(date: Optional[TIME] = None, verify_tls: bool = True) -> st
    
     Example download URL: 
 
-    - https://epss.cyentia.com/epss_scores-2024-01-01.csv.gz
+    - https://epss.empiricalsecurity.com/epss_scores-2024-01-01.csv.gz
+    
+    Parameters:
+        date: The date for which to get EPSS scores
+        verify_tls: Whether to verify TLS certificates
+        download_url_base: The base URL for downloading EPSS scores (default: https://epss.empiricalsecurity.com)
     """
-    date = util.parse_date(date) if date else get_max_date(verify_tls=verify_tls)
-    return f"https://epss.cyentia.com/epss_scores-{date.isoformat()}.csv.gz"
+    date = util.parse_date(date) if date else get_max_date(verify_tls=verify_tls, download_url_base=download_url_base)
+    return f"{download_url_base}/epss_scores-{date.isoformat()}.csv.gz"
 
 
 def get_min_date(
         include_v1_scores: bool = False, 
         include_v2_scores: bool = False,
-        include_v3_scores: bool = True) -> datetime.date:
+        include_v3_scores: bool = True,
+        include_v4_scores: bool = False) -> datetime.date:
     """
     Returns the earliest publication date for EPSS scores under the specified model version constraints.
     """
@@ -343,6 +360,8 @@ def get_min_date(
         return get_epss_v2_min_date()
     elif include_v3_scores:
         return get_epss_v3_min_date()
+    elif include_v4_scores:
+        return get_epss_v4_min_date()
     else:
         logger.warning('Cannot exclude all versions of EPSS scores. Defaulting to EPSS v3.')
         return get_epss_v3_min_date()
@@ -383,49 +402,132 @@ def get_epss_v3_min_date() -> datetime.date:
     return util.parse_date(V3_RELEASE_DATE)
 
 
-def get_epss_v3_max_date(verify_tls: bool = True) -> datetime.date:
+def get_epss_v3_max_date(verify_tls: bool = True, download_url_base: str = DEFAULT_DOWNLOAD_URL_BASE) -> datetime.date:
     """
     Returns the latest publication date for EPSS v3 scores.
+    
+    If EPSS v4 is available, returns the day before EPSS v4 release date.
+    Otherwise, returns the latest available date.
     """
-    url = "https://epss.cyentia.com/epss_scores-current.csv.gz"
+    # Check if we've reached v4 release date
+    today = datetime.date.today()
+    v4_min_date = util.parse_date(V4_RELEASE_DATE)
+    
+    if today >= v4_min_date:
+        # Return the day before v4 was released
+        return v4_min_date - datetime.timedelta(days=1)
+    
+    # Otherwise get the latest date
+    url = f"{download_url_base}/epss_scores-current.csv.gz"
     logger.debug("Resolving latest publication date for EPSS scores")
 
-    response = requests.head(url, verify=verify_tls)
-    location = response.headers["Location"]
-    assert location is not None, "No Location header found"
-    regex = r"(\d{4}-\d{2}-\d{2})"
-    match = re.search(regex, location)
-    assert match is not None, f"No date found in {location}"
-    date = datetime.date.fromisoformat(match.group(1))
+    try:
+        response = requests.head(url, verify=verify_tls, allow_redirects=True)
+        
+        # Check if there's a redirect with a date
+        if response.history and 'Location' in response.history[0].headers:
+            location = response.history[0].headers["Location"]
+            regex = r"(\d{4}-\d{2}-\d{2})"
+            match = re.search(regex, location)
+            if match:
+                date = datetime.date.fromisoformat(match.group(1))
+                logger.debug(f'EPSS scores were last published on {date.isoformat()}')
+                return date
+        
+        # If we can't extract from redirect, try to get current date
+        # This is a fallback that assumes scores are updated daily
+        current_date = datetime.date.today()
+        logger.warning(f'Could not extract publication date from response, using current date: {current_date.isoformat()}')
+        return current_date
+        
+    except Exception as e:
+        logger.error(f"Error determining max date: {e}")
+        # Fallback to current date
+        current_date = datetime.date.today()
+        logger.warning(f'Using current date as fallback: {current_date.isoformat()}')
+        return current_date
 
-    logger.debug(f'EPSS scores were last published on {date.isoformat()}')
-    return date
+
+def get_epss_v4_min_date() -> datetime.date:
+    """
+    Returns the earliest publication date for EPSS v4 scores.
+    """
+    return util.parse_date(V4_RELEASE_DATE)
+
+
+def get_epss_v4_max_date(verify_tls: bool = True, download_url_base: str = DEFAULT_DOWNLOAD_URL_BASE) -> datetime.date:
+    """
+    Returns the latest publication date for EPSS v4 scores.
+    """
+    # Check if we've reached v4 release date
+    today = datetime.date.today()
+    v4_min_date = util.parse_date(V4_RELEASE_DATE)
+    
+    if today < v4_min_date:
+        # V4 is not yet released, return its release date
+        logger.warning(f'EPSS v4 is not yet released. It will be available on {v4_min_date.isoformat()}')
+        return v4_min_date
+    
+    # Get the latest date
+    url = f"{download_url_base}/epss_scores-current.csv.gz"
+    logger.debug("Resolving latest publication date for EPSS scores")
+
+    try:
+        response = requests.head(url, verify=verify_tls, allow_redirects=True)
+        
+        # Check if there's a redirect with a date
+        if response.history and 'Location' in response.history[0].headers:
+            location = response.history[0].headers["Location"]
+            regex = r"(\d{4}-\d{2}-\d{2})"
+            match = re.search(regex, location)
+            if match:
+                date = datetime.date.fromisoformat(match.group(1))
+                logger.debug(f'EPSS scores were last published on {date.isoformat()}')
+                return date
+        
+        # Fallback to current date
+        current_date = datetime.date.today()
+        logger.warning(f'Could not extract publication date from response, using current date: {current_date.isoformat()}')
+        return current_date
+        
+    except Exception as e:
+        logger.error(f"Error determining max date: {e}")
+        # Fallback to current date
+        current_date = datetime.date.today()
+        logger.warning(f'Using current date as fallback: {current_date.isoformat()}')
+        return current_date
 
 
 def get_max_date(
         include_v1_scores: bool = False,
         include_v2_scores: bool = False,
         include_v3_scores: bool = True,
-        verify_tls: bool = True) -> datetime.date:
+        include_v4_scores: bool = False,
+        verify_tls: bool = True,
+        download_url_base: str = DEFAULT_DOWNLOAD_URL_BASE) -> datetime.date:
     """
     Returns the latest publication date for EPSS scores under the specified model version constraints.
     """
-    if include_v3_scores:
-        return get_epss_v3_max_date(verify_tls=verify_tls)
+    if include_v4_scores:
+        return get_epss_v4_max_date(verify_tls=verify_tls, download_url_base=download_url_base)
+    elif include_v3_scores:
+        return get_epss_v3_max_date(verify_tls=verify_tls, download_url_base=download_url_base)
     elif include_v2_scores:
         return get_epss_v2_max_date()
     elif include_v1_scores:
         return get_epss_v1_max_date()
     else:
         logger.warning('Cannot exclude all versions of EPSS scores. Defaulting to EPSS v3.')
-        return get_epss_v3_max_date(verify_tls=verify_tls)
+        return get_epss_v3_max_date(verify_tls=verify_tls, download_url_base=download_url_base)
 
 
 def get_date_range(
         include_v1_scores: bool = False,
         include_v2_scores: bool = False,
         include_v3_scores: bool = True,
-        verify_tls: bool = True) -> Tuple[datetime.date, datetime.date]:
+        include_v4_scores: bool = False,
+        verify_tls: bool = True,
+        download_url_base: str = DEFAULT_DOWNLOAD_URL_BASE) -> Tuple[datetime.date, datetime.date]:
     """
     Resolve the earliest and latest publication dates for EPSS scores under the specified model version constraints.
     """
@@ -433,21 +535,24 @@ def get_date_range(
         include_v1_scores=include_v1_scores,
         include_v2_scores=include_v2_scores,
         include_v3_scores=include_v3_scores,
+        include_v4_scores=include_v4_scores,
     )
     max_date = get_max_date(
         include_v1_scores=include_v1_scores,
         include_v2_scores=include_v2_scores,
         include_v3_scores=include_v3_scores,
+        include_v4_scores=include_v4_scores,
         verify_tls=verify_tls,
+        download_url_base=download_url_base,
     )
     return min_date, max_date
 
 
-def get_date_range(verify_tls: bool = True) -> Tuple[datetime.date, datetime.date]:
+def get_date_range(verify_tls: bool = True, download_url_base: str = DEFAULT_DOWNLOAD_URL_BASE) -> Tuple[datetime.date, datetime.date]:
     """
     Returns a tuple containing the earliest and latest publication dates for EPSS scores.
     """
-    return get_min_date(), get_max_date(verify_tls=verify_tls)
+    return get_min_date(), get_max_date(verify_tls=verify_tls, download_url_base=download_url_base)
 
 
 def get_changed_scores(a: pl.DataFrame, b: pl.DataFrame) -> pl.DataFrame:
