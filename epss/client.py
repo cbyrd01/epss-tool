@@ -17,7 +17,7 @@ from epss.constants import (
     DOWNLOAD_TIMEOUT, LARGE_DOWNLOAD_THRESHOLD, DOWNLOAD_WARNING_ENABLED,
     DOWNLOAD_SPEED_CONFIG, DEFAULT_DOWNLOAD_SPEED, DOWNLOAD_SPEEDS,
     MODEL_VERSION_V1, MODEL_VERSION_V2, MODEL_VERSION_V3, MODEL_VERSION_V4,
-    DEFAULT_MODEL_VERSIONS, VERSION_TO_DATE
+    DEFAULT_MODEL_VERSIONS, VERSION_TO_DATE, EPSS_VERSION
 )
 import polars as pl
 import concurrent.futures
@@ -287,9 +287,14 @@ class BaseClient(ClientInterface):
                     skip_rows = 1
                     
                 df = pl.read_csv(data, skip_rows=skip_rows)
+                
+                # Add date and epss_version columns
+                epss_version = get_epss_version_for_date(date)
                 df = df.with_columns(
                     date=date,
+                    epss_version=epss_version,
                 )
+                
                 util.write_dataframe(df=df, path=path)
                 return
             except (requests.RequestException, IOError) as e:
@@ -381,8 +386,13 @@ class PolarsClient(BaseClient):
         if 'cve' not in df.columns:
             raise ValueError(f'The dataframe for {date.isoformat()} does not contain a `cve` column (columns: {df.columns})')
 
-        # Use the following column order: date, cve, epss, percentile
-        df = df.select(['date', 'cve', 'epss', 'percentile'])
+        # Use the following column order: date, cve, epss, percentile, epss_version
+        if EPSS_VERSION not in df.columns:
+            # Add version column if it doesn't exist (for backward compatibility with existing files)
+            epss_version = get_epss_version_for_date(date)
+            df = df.with_columns(epss_version=epss_version)
+            
+        df = df.select(['date', 'cve', 'epss', 'percentile', 'epss_version'])
 
         df = df.sort(by=['cve'], descending=True)
         df = df.sort(by=['date'], descending=False)
@@ -457,6 +467,27 @@ def get_download_url(
     """
     date = util.parse_date(date) if date else get_max_date(verify_tls=verify_tls, download_url_base=download_url_base)
     return f"{download_url_base}/epss_scores-{date.isoformat()}.csv.gz"
+
+
+def get_epss_version_for_date(date: TIME) -> int:
+    """
+    Returns the EPSS version number for a given date.
+    
+    EPSS versions:
+    - Version 1: 2021-04-14 to 2022-02-03
+    - Version 2: 2022-02-04 to 2023-03-06
+    - Version 3: 2023-03-07 to 2025-03-16
+    - Version 4: 2025-03-17 onwards
+    """
+    date = util.parse_date(date)
+    if date < util.parse_date(V2_RELEASE_DATE):
+        return 1
+    elif date < util.parse_date(V3_RELEASE_DATE):
+        return 2
+    elif date < util.parse_date(V4_RELEASE_DATE):
+        return 3
+    else:
+        return 4
 
 
 def get_min_date(
@@ -739,5 +770,12 @@ def read_dataframe(path: str, date: Optional[TIME] = None) -> pl.DataFrame:
             assert date is not None, "ISO-8601 date not found in filename (YYYY-MM-DD)"
 
         df = df.with_columns(date=date)
+        
+    # Add epss_version if missing (for backward compatibility)
+    if EPSS_VERSION not in df.columns and 'date' in df.columns:
+        # Use the first date in the dataframe to determine version
+        first_date = df.select('date').row(0)[0]
+        epss_version = get_epss_version_for_date(first_date)
+        df = df.with_columns(epss_version=epss_version)
 
     return df

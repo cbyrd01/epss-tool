@@ -25,17 +25,18 @@ DEFAULT_CONSOLE_OUTPUT_FORMAT = TABLE
 
 
 @click.group()
-@click.option('--file-format', default=DEFAULT_FILE_FORMAT, type=click.Choice(FILE_FORMATS), show_default=True, help='File format')
+@click.option('--download-format', default=DEFAULT_FILE_FORMAT, type=click.Choice(FILE_FORMATS), show_default=True, 
+              help='Format for downloading EPSS data files')
 @click.option('--include-versions', default=DEFAULT_MODEL_VERSIONS, show_default=True, 
               help='Model versions to include (comma-separated: v1,v2,v3,v4 or "all")')
 @click.option('--verify-tls/--no-verify-tls', default=True, help='Verify TLS certificates when downloading scores')
 @click.option('--download-speed', type=click.Choice(DOWNLOAD_SPEEDS), default=DEFAULT_DOWNLOAD_SPEED, 
               show_default=True, help='Download speed (polite=1 concurrent/1s delay, normal=5 concurrent/0.5s delay, fast=10 concurrent/no delay)')
-@click.option('--verbose', '-v', is_flag=True, help='Enable verbose logging')
+@click.option('-v', '--verbose', is_flag=True, help='Enable verbose logging')
 @click.pass_context
 def main(
     ctx: click.Context, 
-    file_format: str,
+    download_format: str,
     include_versions: str,
     verify_tls: bool,
     download_speed: str,
@@ -90,7 +91,7 @@ def main(
 
     ctx.obj = {
         'client': Client(
-            file_format=file_format,
+            file_format=download_format,
             include_v1_scores=include_v1,
             include_v2_scores=include_v2,
             include_v3_scores=include_v3,
@@ -103,11 +104,11 @@ def main(
 
 @main.command('scores')
 @click.option('--workdir', '-w', default=SCORES_BY_DATE_WORKDIR, show_default=True, help='Work directory')
-@click.option('--min-date', '-a', show_default=True, help='Minimum date')
-@click.option('--date', '-d', help='Date')
-@click.option('--max-date', '-b', help='Maximum date')
+@click.option('--min-date', '-a', show_default=True, help='Minimum date (YYYY-MM-DD)')
+@click.option('--max-date', '-b', help='Maximum date (YYYY-MM-DD)')
 @click.option('--output-file', '-o', help='Output file')
-@click.option('--output-format', '-f', type=click.Choice(OUTPUT_FORMATS), help='Output format')
+@click.option('--output-format', '-f', type=click.Choice(OUTPUT_FORMATS), help='Format for the command output')
+@click.option('--output-sort', '-s', help='Sort output (e.g., "-epss,+date" where - is descending, + is ascending)')
 @click.option('--drop-unchanged/--no-drop-unchanged', 'drop_unchanged_scores', default=True, show_default=True, help='Drop unchanged scores')
 @click.option('--download', is_flag=True, help="Don't write to an output file or the console, just download the data")
 @click.option('--no-warning', is_flag=True, help="Skip warning for large downloads")
@@ -117,24 +118,31 @@ def get_scores_cli(
     ctx: click.Context, 
     workdir: str,
     min_date: Optional[str],
-    date: Optional[str],
     max_date: Optional[str],
     output_file: Optional[str],
     output_format: Optional[str],
+    output_sort: Optional[str],
     drop_unchanged_scores: bool,
     download: bool,
     no_warning: bool,
     verbose: bool):
     """
-    Get scores
+    Get EPSS scores for CVEs
+    
+    Specify a date range with --min-date and --max-date (both in YYYY-MM-DD format).
+    For a single date, set both --min-date and --max-date to the same date.
+    
+    Sort with --output-sort option using format: "-column1,+column2" where:
+    - "-" prefix sorts in descending order
+    - "+" prefix sorts in ascending order
+    - No prefix defaults to ascending order
+    - Multiple columns are separated by commas
+    
+    Example: --output-sort "-epss,+date" sorts by epss (highest first) then by date (oldest first)
     """
     # Override logging level if verbose flag is specified at subcommand level
     if verbose:
         logging.getLogger().setLevel(logging.DEBUG)
-        
-    if date:
-        min_date = date
-        max_date = date
 
     client: Client = ctx.obj['client']
     if download:
@@ -151,59 +159,101 @@ def get_scores_cli(
             max_date=max_date,
             drop_unchanged_scores=drop_unchanged_scores,
         )
-        df = df.sort(by=['cve'], descending=True)
-        df = df.sort(by=['epss'], descending=True)
-        df = df.sort(by=['date'], descending=False)
+        
+        # Apply custom sorting if specified, otherwise use default sorting
+        if output_sort:
+            df = sort_dataframe_by_spec(df, output_sort)
+        else:
+            # Default sorting
+            df = df.sort(by=['cve'], descending=True)
+            df = df.sort(by=['epss'], descending=True)
+            df = df.sort(by=['date'], descending=False)
+            
         write_output(df, output_file, output_format)
 
 
 @main.command('urls')
-@click.option('--min-date', '-a', show_default=True, help='Minimum date')
-@click.option('--max-date', '-b', help='Maximum date')
-@click.option('--date', '-d', help='Date')
+@click.option('--min-date', '-a', show_default=True, help='Minimum date (YYYY-MM-DD)')
+@click.option('--max-date', '-b', help='Maximum date (YYYY-MM-DD)')
+@click.option('--output-format', '-f', type=click.Choice(OUTPUT_FORMATS), help='Format for the command output')
+@click.option('--output-file', '-o', help='Output file')
+@click.option('--output-sort', '-s', help='Sort output (e.g., "-urls" where - is descending, + is ascending)')
 @click.pass_context
 def get_urls_cli(
     ctx: click.Context, 
     min_date: Optional[str],
     max_date: Optional[str],
-    date: Optional[str]):
+    output_format: Optional[str],
+    output_file: Optional[str],
+    output_sort: Optional[str]):
     """
-    Get URLs
+    Get URLs for EPSS data files
+    
+    Specify a date range with --min-date and --max-date (both in YYYY-MM-DD format).
+    For a single date, set both --min-date and --max-date to the same date.
+    
+    Sort with --output-sort option using format: "-column" where:
+    - "-" prefix sorts in descending order
+    - "+" prefix sorts in ascending order
+    - No prefix defaults to ascending order
     """
     client: Client = ctx.obj['client']
-
-    if date:
-        min_date = date
-        max_date = date
 
     urls = client.iter_urls(
         min_date=min_date,
         max_date=max_date,
     )
-    for url in urls:
-        print(url)
+    df = pl.DataFrame({'urls': urls})
+    
+    # Apply custom sorting if specified
+    if output_sort:
+        df = sort_dataframe_by_spec(df, output_sort)
+        
+    format_to_use = output_format or ctx.parent.params['download_format']
+    _output_data(df, format_to_use, output_file)
 
 
 @main.command('date-range')
-@click.option('--min-date', '-a', help='Minimum date')
-@click.option('--max-date', '-b', help='Maximum date')
+@click.option('--min-date', '-a', help='Minimum date (YYYY-MM-DD)')
+@click.option('--max-date', '-b', help='Maximum date (YYYY-MM-DD)')
+@click.option('--output-format', '-f', type=click.Choice(OUTPUT_FORMATS), help='Format for the command output')
+@click.option('--output-file', '-o', help='Output file')
+@click.option('--output-sort', '-s', help='Sort output (e.g., "-min_date" where - is descending, + is ascending)')
 @click.pass_context
 def get_date_range_cli(
     ctx: click.Context, 
     min_date: Optional[str],
-    max_date: Optional[str]):
+    max_date: Optional[str],
+    output_format: Optional[str],
+    output_file: Optional[str],
+    output_sort: Optional[str]):
     """
-    Preview date ranges
+    Preview available date ranges for EPSS data
+    
+    Specify a date range with --min-date and --max-date (both in YYYY-MM-DD format).
+    For a single date, set both --min-date and --max-date to the same date.
+    
+    Sort with --output-sort option using format: "-column" where:
+    - "-" prefix sorts in descending order
+    - "+" prefix sorts in ascending order
+    - No prefix defaults to ascending order
     """
     client: Client = ctx.obj['client']
     min_date, max_date = client.get_date_range(
         min_date=min_date,
         max_date=max_date,
     )
-    print(json.dumps({
+    df = pl.DataFrame([{
         'min_date': min_date.isoformat(),
         'max_date': max_date.isoformat(),
-    }, cls=JSONEncoder))
+    }])
+    
+    # Apply custom sorting if specified
+    if output_sort:
+        df = sort_dataframe_by_spec(df, output_sort)
+        
+    format_to_use = output_format or ctx.parent.params['download_format']
+    _output_data(df, format_to_use, output_file)
 
 
 def write_output(df: pl.DataFrame, output_file: Optional[str], output_format: Optional[str]):
@@ -223,6 +273,75 @@ def write_output(df: pl.DataFrame, output_file: Optional[str], output_format: Op
             print(df.write_csv()) 
         else:
             raise ValueError(f"Invalid output format: {output_format}")
+
+
+def _output_data(df, format_to_use, output_file=None):
+    """Output data in the specified format to file or console."""
+    if output_file:
+        if format_to_use == TABLE:
+            # Default to CSV for file output when TABLE is selected
+            df.write_csv(output_file)
+            logger.info(f"Data written to {output_file}")
+        else:
+            # Use the specified format
+            if format_to_use == CSV:
+                df.write_csv(output_file)
+            elif format_to_use == JSON:
+                util.write_json(df, output_file)
+            elif format_to_use == JSONL:
+                util.write_ndjson(df, output_file)
+            elif format_to_use == PARQUET:
+                util.write_parquet(df, output_file)
+            logger.info(f"Data written to {output_file}")
+    else:
+        # Print to console
+        if format_to_use == TABLE:
+            print(df)
+        elif format_to_use == CSV:
+            print(df.write_csv())
+        elif format_to_use == JSON:
+            print(json.dumps(df.to_dicts(), cls=JSONEncoder))
+        elif output_format == JSONL:
+            for d in df.to_dicts():
+                print(json.dumps(d, cls=JSONEncoder))
+        elif format_to_use == PARQUET:
+            logger.warning("Cannot display Parquet format to console, showing table instead")
+            print(df)
+
+
+def sort_dataframe_by_spec(df: pl.DataFrame, sort_spec: str) -> pl.DataFrame:
+    """Sort dataframe according to a sort specification string.
+    
+    Format: "-col1,+col2,col3" where:
+    - "-" prefix means descending order
+    - "+" prefix means ascending order
+    - No prefix defaults to ascending order
+    - Multiple columns separated by commas
+    """
+    if not sort_spec:
+        return df
+        
+    parts = [part.strip() for part in sort_spec.split(',')]
+    for part in parts:
+        if not part:
+            continue
+            
+        descending = False
+        col_name = part
+        
+        if part.startswith('-'):
+            descending = True
+            col_name = part[1:]
+        elif part.startswith('+'):
+            col_name = part[1:]
+            
+        if col_name not in df.columns:
+            logger.warning(f"Column '{col_name}' not found in dataframe, skipping sort")
+            continue
+            
+        df = df.sort(by=[col_name], descending=descending)
+        
+    return df
 
 
 if __name__ == '__main__':

@@ -97,6 +97,7 @@ EPSS = 'epss'
 PERCENTILE = 'percentile'
 CVE = 'cve'
 DATE = 'date'
+EPSS_VERSION = 'epss_version'  # New constant for version column
 
 # Partitioning keys
 PARTITIONING_KEYS = {CVE, DATE}
