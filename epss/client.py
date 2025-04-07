@@ -92,6 +92,11 @@ class BaseClient(ClientInterface):
     include_v4_scores: bool = MODEL_VERSION_V4 in DEFAULT_MODEL_VERSIONS.split(',')
     download_url_base: str = DEFAULT_DOWNLOAD_URL_BASE
     download_speed: str = DEFAULT_DOWNLOAD_SPEED
+    missing_dates: List[datetime.date] = None  # Track missing dates
+    
+    def __post_init__(self):
+        if self.missing_dates is None:
+            self.missing_dates = []
 
     @property
     def max_concurrent_downloads(self) -> int:
@@ -194,6 +199,9 @@ class BaseClient(ClientInterface):
         min_date, max_date = self.get_date_range(min_date=min_date, max_date=max_date)
         logger.info('Downloading scores for date range: %s - %s', min_date, max_date)
         
+        # Clear missing dates before new download operation
+        self.missing_dates = []
+        
         # Check if the date range includes the current day
         today = datetime.date.today()
         if CURRENT_DAY_WARNING_ENABLED and not no_warnings and max_date >= today:
@@ -237,6 +245,7 @@ class BaseClient(ClientInterface):
         batches = list(util.iter_chunks(pending_downloads, self.max_concurrent_downloads))
         total_files = len(pending_downloads)
         completed = 0
+        failed = 0
         
         for i, batch in enumerate(batches):
             logger.debug(f"Processing batch {i+1}/{len(batches)} ({len(batch)} files)")
@@ -252,24 +261,43 @@ class BaseClient(ClientInterface):
                     futures[future] = date
                 
                 for future in concurrent.futures.as_completed(futures):
+                    date = futures[future]
                     try:
-                        future.result()
-                        completed += 1
-                        if completed % 10 == 0 or completed == total_files:
-                            logger.info('Downloaded %d/%d files', completed, total_files)
+                        success = future.result()
+                        if success:
+                            completed += 1
+                            if completed % 10 == 0 or completed == total_files:
+                                logger.info('Downloaded %d/%d files', completed, total_files)
+                        else:
+                            # If download_scores_by_date returns False, it's a permanent failure
+                            failed += 1
+                            if date not in self.missing_dates:
+                                self.missing_dates.append(date)
+                            logger.warning('Unable to download scores for %s (permanently unavailable)', date.isoformat())
                     except Exception as e:
-                        logger.warning('Failed to download scores for %s: %s', futures[future].isoformat(), e)
+                        failed += 1
+                        if date not in self.missing_dates:
+                            self.missing_dates.append(date)
+                        logger.warning('Failed to download scores for %s: %s', date.isoformat(), e)
             
             # Apply delay between batches (except for the last batch)
             if i < len(batches) - 1 and self.batch_delay > 0:
                 logger.debug(f"Waiting {self.batch_delay}s before next batch")
                 time.sleep(self.batch_delay)
          
-        logger.info("All downloads completed")
+        if failed > 0:
+            logger.warning("Download completed with %d/%d files unavailable", failed, total_files)
+            missing_dates_str = ', '.join(d.isoformat() for d in sorted(self.missing_dates)[:10])
+            if len(self.missing_dates) > 10:
+                missing_dates_str += f" and {len(self.missing_dates) - 10} more"
+            logger.warning("Missing dates: %s", missing_dates_str)
+        else:
+            logger.info("All downloads completed successfully")
 
-    def download_scores_by_date(self, workdir: str, date: TIME):
+    def download_scores_by_date(self, workdir: str, date: TIME) -> bool:
         """
         Download EPSS scores published on the specified date.
+        Returns True if successful, False if the file is permanently unavailable.
         """
         date = util.parse_date(date)
         path = get_file_path(
@@ -279,16 +307,24 @@ class BaseClient(ClientInterface):
         )
         if os.path.exists(path):
             logger.debug("Scores for %s have already been downloaded: %s", date.isoformat(), path)
-            return
+            return True
         
         url = get_download_url(date, verify_tls=self.verify_tls, download_url_base=self.download_url_base)
         logger.debug('Downloading scores for %s: %s -> %s', date.isoformat(), url, path)
 
         # Implement retry with exponential backoff
         retry_count = 0
+        permanent_failure = False
+        
         while retry_count <= DOWNLOAD_RETRY_COUNT:
             try:
                 response = requests.get(url, verify=self.verify_tls, stream=True, timeout=DOWNLOAD_TIMEOUT)
+                
+                # For 403/404 errors, we consider these permanent failures after first attempt
+                if response.status_code in (403, 404):
+                    permanent_failure = True
+                    response.raise_for_status()  # This will raise an exception
+                
                 response.raise_for_status()
                 
                 data = io.BytesIO(response.content)
@@ -308,10 +344,29 @@ class BaseClient(ClientInterface):
                 )
                 
                 util.write_dataframe(df=df, path=path)
-                return
+                return True
             except (requests.RequestException, IOError) as e:
                 retry_count += 1
-                if retry_count <= DOWNLOAD_RETRY_COUNT:
+                
+                # Don't retry for permanent failures (like 403/404)
+                if permanent_failure or retry_count > DOWNLOAD_RETRY_COUNT:
+                    if permanent_failure:
+                        logger.warning(
+                            'Data for %s is unavailable (received %s). This date will be skipped.', 
+                            date.isoformat(), 
+                            f"{getattr(e.response, 'status_code', 'unknown error')} {getattr(e.response, 'reason', '')}" if hasattr(e, 'response') else str(e)
+                        )
+                    else:
+                        logger.error(
+                            'Failed to download scores for %s after %d attempts: %s', 
+                            date.isoformat(), DOWNLOAD_RETRY_COUNT + 1, e
+                        )
+                    
+                    # Add to missing dates list if not already there
+                    if date not in self.missing_dates:
+                        self.missing_dates.append(date)
+                    return False
+                else:
                     # Calculate exponential backoff delay
                     delay = DOWNLOAD_RETRY_DELAY * (2 ** (retry_count - 1))
                     logger.warning(
@@ -319,12 +374,6 @@ class BaseClient(ClientInterface):
                         date.isoformat(), retry_count, DOWNLOAD_RETRY_COUNT + 1, e, delay
                     )
                     time.sleep(delay)
-                else:
-                    logger.error(
-                        'Failed to download scores for %s after %d attempts: %s', 
-                        date.isoformat(), DOWNLOAD_RETRY_COUNT + 1, e
-                    )
-                    raise
 
 
 @dataclass()
@@ -332,6 +381,9 @@ class PolarsClient(BaseClient):
     """
     A client for working with EPSS scores using Polars DataFrames.
     """
+    # Add a new parameter to control memory usage
+    max_memory_gb: Optional[float] = None
+    
     def get_scores(
             self, 
             workdir: str,
@@ -347,33 +399,232 @@ class PolarsClient(BaseClient):
             min_date -= datetime.timedelta(days=-1)
         
         if min_date == max_date:
-            return self.get_scores_by_date(workdir=workdir, date=min_date, query=query)
+            try:
+                return self.get_scores_by_date(workdir=workdir, date=min_date, query=query)
+            except Exception as e:
+                logger.warning(f"Failed to get scores for {min_date.isoformat()}: {e}")
+                if min_date not in self.missing_dates:
+                    self.missing_dates.append(min_date)
+                return pl.DataFrame(schema={'date': pl.Date, 'cve': pl.Utf8, 'epss': pl.Float64, 'percentile': pl.Float64, 'epss_version': pl.Int64})
         
+        # NEW: Process dates in smaller batches to conserve memory
+        dates = list(self.iter_dates(min_date, max_date))
+        all_dates_set = set(dates)
+        
+        # Determine batch size based on number of dates
+        date_count = len(dates)
+        
+        # If we have many dates to process, use batching to avoid OOM
+        if date_count > 30:  # Arbitrary threshold, adjust based on your environment
+            logger.info(f"Processing {date_count} dates in batches to optimize memory usage")
+            return self._get_scores_in_batches(workdir, dates, query, drop_unchanged_scores, all_dates_set)
+        
+        # Original processing for smaller date ranges
         resolver = functools.partial(
-            self.get_scores_by_date,
+            self.get_scores_by_date_safe,
             workdir=workdir,
             query=query,
         )
-        dates = list(self.iter_dates(min_date, max_date))
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_concurrent_downloads) as executor:
-            dfs = list(executor.map(lambda date: resolver(date=date), dates))
+            # Use a list comprehension with immediate garbage collection instead of keeping all in memory
+            dfs = []
+            for df in executor.map(lambda date: resolver(date=date), dates):
+                if df is not None and not df.is_empty():
+                    dfs.append(df)
+            
+            if not dfs:
+                logger.warning("No data available for the requested date range")
+                return pl.DataFrame(schema={'date': pl.Date, 'cve': pl.Utf8, 'epss': pl.Float64, 'percentile': pl.Float64, 'epss_version': pl.Int64})
             
             if drop_unchanged_scores is False:
-                df = pl.concat(dfs)
+                # Memory-efficient concatenation with explicit cleanup
+                try:
+                    df = pl.concat(dfs)
+                    # Clear the list to free memory
+                    dfs = None
+                except Exception as e:
+                    logger.error(f"Error concatenating dataframes: {e}")
+                    # If we run out of memory here, try processing in batches instead
+                    return self._get_scores_in_batches(workdir, dates, query, drop_unchanged_scores, all_dates_set)
             else:
                 if len(dfs) < 2:
-                    return dfs[0] if dfs else pl.DataFrame()
+                    return dfs[0] if dfs else pl.DataFrame(schema={'date': pl.Date, 'cve': pl.Utf8, 'epss': pl.Float64, 'percentile': pl.Float64, 'epss_version': pl.Int64})
+                
+                # Process changes in a memory-efficient way
+                try:
+                    first = get_changed_scores(dfs[0], dfs[1])
+                    result_dfs = [first]
                     
-                first = get_changed_scores(dfs[0], dfs[1])
-                changes = executor.map(lambda e: get_changed_scores(*e), util.iter_pairwise(dfs[1:]))
-
-                df = pl.concat(itertools.chain([first], changes))
+                    # Process pairs one at a time
+                    for a, b in util.iter_pairwise(dfs[1:]):
+                        changed = get_changed_scores(a, b)
+                        result_dfs.append(changed)
+                    
+                    df = pl.concat(result_dfs)
+                    # Clear lists to free memory
+                    dfs = None
+                    result_dfs = None
+                except Exception as e:
+                    logger.error(f"Error processing changed scores: {e}")
+                    # If we run out of memory here, try processing in batches instead
+                    return self._get_scores_in_batches(workdir, dates, query, drop_unchanged_scores, all_dates_set)
             
+            # Check for missing dates in the resulting dataset
+            try:
+                included_dates_set = set(df.select('date').unique().to_series().to_list())
+                missing_dates_set = all_dates_set - included_dates_set
+                
+                if missing_dates_set:
+                    missing_dates_list = sorted(list(missing_dates_set))
+                    self.missing_dates.extend(missing_dates_list)
+                    missing_dates_str = ', '.join(d.isoformat() for d in missing_dates_list[:10])
+                    if len(missing_dates_list) > 10:
+                        missing_dates_str += f" and {len(missing_dates_list) - 10} more"
+                    logger.warning("Data is missing for %d date(s): %s", len(missing_dates_list), missing_dates_str)
+                
+                df = df.sort(by=['cve'], descending=True)
+                df = df.sort(by=['date'], descending=False)
+                return df
+            except Exception as e:
+                logger.error(f"Error in final processing: {e}")
+                # If we run out of memory during final processing, return a new empty dataframe
+                return pl.DataFrame(schema={'date': pl.Date, 'cve': pl.Utf8, 'epss': pl.Float64, 'percentile': pl.Float64, 'epss_version': pl.Int64})
+
+    def _get_scores_in_batches(self, workdir, dates, query, drop_unchanged_scores, all_dates_set):
+        """
+        Process large date ranges in smaller batches to avoid memory issues.
+        """
+        # Define a reasonable batch size based on environment
+        batch_size = 10  # Process 10 dates at a time
+        batch_count = (len(dates) + batch_size - 1) // batch_size  # Ceiling division
+        
+        logger.info(f"Processing {len(dates)} dates in {batch_count} batches of {batch_size}")
+        
+        # Create a schema for empty dataframes
+        schema = {'date': pl.Date, 'cve': pl.Utf8, 'epss': pl.Float64, 'percentile': pl.Float64, 'epss_version': pl.Int64}
+        
+        # Process each batch and combine results
+        all_results = []
+        for i in range(0, len(dates), batch_size):
+            batch = dates[i:i+batch_size]
+            logger.info(f"Processing batch {i//batch_size + 1}/{batch_count} ({len(batch)} dates)")
+            
+            # Get scores for this batch
+            batch_min_date = min(batch)
+            batch_max_date = max(batch)
+            
+            # Use a separate function call to ensure memory is freed between batches
+            batch_df = self._process_date_batch(
+                workdir=workdir,
+                min_date=batch_min_date,
+                max_date=batch_max_date,
+                query=query,
+                drop_unchanged_scores=drop_unchanged_scores
+            )
+            
+            if not batch_df.is_empty():
+                all_results.append(batch_df)
+            
+            # Force garbage collection between batches
+            import gc
+            gc.collect()
+        
+        # Combine all batch results
+        if not all_results:
+            return pl.DataFrame(schema=schema)
+        
+        try:
+            # Try to combine all results at once
+            df = pl.concat(all_results)
+            all_results = None  # Free memory
+            
+            # Check for missing dates in the final dataset
+            included_dates_set = set(df.select('date').unique().to_series().to_list())
+            missing_dates_set = all_dates_set - included_dates_set
+            
+            if missing_dates_set:
+                missing_dates_list = sorted(list(missing_dates_set))
+                self.missing_dates.extend(missing_dates_list)
+                missing_dates_str = ', '.join(d.isoformat() for d in missing_dates_list[:10])
+                if len(missing_dates_list) > 10:
+                    missing_dates_str += f" and {len(missing_dates_list) - 10} more"
+                logger.warning("Data is missing for %d date(s): %s", len(missing_dates_list), missing_dates_str)
+            
+            # Apply final sorting
             df = df.sort(by=['cve'], descending=True)
             df = df.sort(by=['date'], descending=False)
             return df
+        
+        except Exception as e:
+            logger.error(f"Failed to combine batch results: {e}")
+            
+            # Emergency fallback: return just the first batch result if we can't combine
+            if all_results:
+                logger.warning("Returning partial results due to memory constraints")
+                return all_results[0]
+            else:
+                return pl.DataFrame(schema=schema)
 
+    def _process_date_batch(self, workdir, min_date, max_date, query, drop_unchanged_scores):
+        """
+        Process a small batch of dates - this function is called separately to ensure
+        memory from one batch is released before processing the next batch.
+        """
+        resolver = functools.partial(
+            self.get_scores_by_date_safe,
+            workdir=workdir,
+            query=query,
+        )
+        
+        batch_dates = list(self.iter_dates(min_date, max_date))
+        
+        dfs = []
+        # Process sequentially to better control memory usage
+        for date in batch_dates:
+            df = resolver(date=date)
+            if df is not None and not df.is_empty():
+                dfs.append(df)
+        
+        if not dfs:
+            return pl.DataFrame(schema={
+                'date': pl.Date, 'cve': pl.Utf8, 'epss': pl.Float64, 
+                'percentile': pl.Float64, 'epss_version': pl.Int64
+            })
+        
+        if drop_unchanged_scores is False or len(dfs) < 2:
+            if len(dfs) == 1:
+                return dfs[0]
+            return pl.concat(dfs)
+        
+        # Process changed scores
+        result_dfs = []
+        first = get_changed_scores(dfs[0], dfs[1])
+        result_dfs.append(first)
+        
+        for i in range(1, len(dfs)-1):
+            changed = get_changed_scores(dfs[i], dfs[i+1])
+            result_dfs.append(changed)
+        
+        return pl.concat(result_dfs)
+    
+    def get_scores_by_date_safe(
+            self,
+            workdir: str, 
+            date: Optional[TIME] = None,
+            query: Optional[Query] = None) -> Optional[pl.DataFrame]:
+        """
+        Safe version of get_scores_by_date that returns None instead of raising exceptions.
+        """
+        try:
+            return self.get_scores_by_date(workdir=workdir, date=date, query=query)
+        except Exception as e:
+            date_obj = util.parse_date(date)
+            logger.warning(f"Failed to get scores for {date_obj.isoformat()}: {e}")
+            if date_obj not in self.missing_dates:
+                self.missing_dates.append(date_obj)
+            return None
+        
     def get_scores_by_date(
             self,
             workdir: str, 
@@ -387,8 +638,15 @@ class PolarsClient(BaseClient):
             key=date.isoformat(),
         )
         if not os.path.exists(path):
-            self.download_scores_by_date(workdir=workdir, date=date)
-            assert os.path.exists(path), f"Scores unexpectedly not downloaded for {date.isoformat()}"
+            # Try to download, but handle case where download fails
+            success = self.download_scores_by_date(workdir=workdir, date=date)
+            if not success:
+                # If we couldn't download, return an empty dataframe with the correct schema
+                schema = {'date': pl.Date, 'cve': pl.Utf8, 'epss': pl.Float64, 'percentile': pl.Float64, 'epss_version': pl.Int64}
+                return pl.DataFrame(schema=schema)
+            
+            if not os.path.exists(path):
+                raise ValueError(f"Scores unexpectedly not downloaded for {date.isoformat()}")
 
         df = read_dataframe(path)
         if query:

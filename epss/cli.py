@@ -152,6 +152,16 @@ def get_scores_cli(
             max_date=max_date,
             no_warnings=no_warnings,
         )
+        
+        # Display warning if we had missing dates after download
+        if client.missing_dates:
+            if len(client.missing_dates) == 1:
+                logger.warning("Data for 1 date could not be downloaded: %s", client.missing_dates[0].isoformat())
+            else:
+                missing_dates_str = ', '.join(d.isoformat() for d in sorted(client.missing_dates)[:10])
+                if len(client.missing_dates) > 10:
+                    missing_dates_str += f" and {len(client.missing_dates) - 10} more"
+                logger.warning("Data for %d dates could not be downloaded: %s", len(client.missing_dates), missing_dates_str)
     else:
         df = client.get_scores(
             workdir=workdir,
@@ -159,6 +169,16 @@ def get_scores_cli(
             max_date=max_date,
             drop_unchanged_scores=drop_unchanged_scores,
         )
+        
+        # Display warning if we had missing dates
+        if client.missing_dates:
+            if len(client.missing_dates) == 1:
+                logger.warning("OUTPUT INCOMPLETE: Data is missing for date: %s", client.missing_dates[0].isoformat())
+            else:
+                missing_dates_str = ', '.join(d.isoformat() for d in sorted(client.missing_dates)[:10])
+                if len(client.missing_dates) > 10:
+                    missing_dates_str += f" and {len(client.missing_dates) - 10} more"
+                logger.warning("OUTPUT INCOMPLETE: Data is missing for %d dates: %s", len(client.missing_dates), missing_dates_str)
         
         # Apply custom sorting if specified, otherwise use default sorting
         if output_sort:
@@ -170,6 +190,10 @@ def get_scores_cli(
             df = df.sort(by=['date'], descending=False)
             
         write_output(df, output_file, output_format)
+        
+        # Display warning after output if we had missing dates
+        if client.missing_dates and not output_file:
+            logger.warning("NOTE: The output above is incomplete due to missing data for some dates.")
 
 
 @main.command('urls')

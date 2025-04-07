@@ -13,19 +13,32 @@ logger = logging.getLogger(__name__)
 
 
 def read_dataframe(path: str, file_format: Optional[str] = None) -> pl.DataFrame:
+    if not os.path.exists(path):
+        logger.warning(f"File not found: {path}")
+        return pl.DataFrame()
+        
     if not file_format:
-        file_format = get_file_format_from_path(path)
+        try:
+            file_format = get_file_format_from_path(path)
+        except ValueError as e:
+            logger.warning(f"Could not determine file format for {path}: {e}")
+            return pl.DataFrame()
 
-    if file_format in [CSV]:
-        df = pl.read_csv(path)
-    elif file_format in [JSON]:
-        df = pl.read_json(path)
-    elif file_format in [JSONL]:
-        df = pl.read_ndjson(path)
-    elif file_format in [PARQUET]:
-        df = pl.read_parquet(path)
-    else:
-        raise ValueError(f"Unsupported file format: {file_format}")
+    try:
+        if file_format in [CSV]:
+            df = pl.read_csv(path)
+        elif file_format in [JSON]:
+            df = pl.read_json(path)
+        elif file_format in [JSONL]:
+            df = pl.read_ndjson(path)
+        elif file_format in [PARQUET]:
+            df = pl.read_parquet(path)
+        else:
+            logger.warning(f"Unsupported file format: {file_format}")
+            return pl.DataFrame()
+    except Exception as e:
+        logger.warning(f"Error reading dataframe from {path}: {e}")
+        return pl.DataFrame()
     
     return df
 
