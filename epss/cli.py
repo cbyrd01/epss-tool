@@ -26,24 +26,25 @@ DEFAULT_CONSOLE_OUTPUT_FORMAT = TABLE
 
 @click.group()
 @click.option('--file-format', default=DEFAULT_FILE_FORMAT, type=click.Choice(FILE_FORMATS), show_default=True, help='File format')
-@click.option('--include-v1-scores/--exclude-v1-scores', is_flag=True, help='Include v1 scores')
-@click.option('--include-v2-scores/--exclude-v2-scores', is_flag=True, help='Include v2 scores')
-@click.option('--include-v3-scores/--exclude-v3-scores', default=True, help='Include v3 scores')
-@click.option('--include-all-scores/--exclude-all-scores', '-A', default=False, help='Include scores produced by all model versions')
+@click.option('--include-versions', default=DEFAULT_MODEL_VERSIONS, show_default=True, 
+              help='Model versions to include (comma-separated: v1,v2,v3,v4 or "all")')
 @click.option('--verify-tls/--no-verify-tls', default=True, help='Verify TLS certificates when downloading scores')
+@click.option('--download-speed', type=click.Choice(DOWNLOAD_SPEEDS), default=DEFAULT_DOWNLOAD_SPEED, 
+              show_default=True, help='Download speed (polite=1 concurrent/1s delay, normal=5 concurrent/0.5s delay, fast=10 concurrent/no delay)')
 @click.option('--verbose', '-v', is_flag=True, help='Enable verbose logging')
 @click.pass_context
 def main(
     ctx: click.Context, 
     file_format: str,
-    include_v1_scores: bool,
-    include_v2_scores: bool,
-    include_v3_scores: bool,
-    include_all_scores: bool,
+    include_versions: str,
     verify_tls: bool,
+    download_speed: str,
     verbose: bool):
     """
     Exploit Prediction Scoring System (EPSS)
+    
+    By default, all available model versions (v1, v2, v3) are included for comprehensive historical data.
+    You can include specific versions using the --include-versions option (e.g. --include-versions v3 or --include-versions v1,v2).
     """
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(level=level, format='%(asctime)s %(levelname)s %(name)s %(message)s')
@@ -51,18 +52,51 @@ def main(
     if verify_tls is False:
         requests.packages.urllib3.disable_warnings() 
 
-    if include_all_scores:
-        include_v1_scores = True
-        include_v2_scores = True
-        include_v3_scores = True
+    # Process the include_versions option
+    versions = include_versions.lower().strip()
+    include_v1 = False
+    include_v2 = False
+    include_v3 = False
+    include_v4 = False
+    
+    if versions == MODEL_VERSION_ALL:
+        include_v1 = include_v2 = include_v3 = include_v4 = True
+    else:
+        versions = [v.strip() for v in versions.split(',')]
+        include_v1 = MODEL_VERSION_V1 in versions
+        include_v2 = MODEL_VERSION_V2 in versions
+        include_v3 = MODEL_VERSION_V3 in versions
+        include_v4 = MODEL_VERSION_V4 in versions
+    
+    # Log the selected versions
+    selected_versions = []
+    if include_v1: selected_versions.append(MODEL_VERSION_V1)
+    if include_v2: selected_versions.append(MODEL_VERSION_V2)
+    if include_v3: selected_versions.append(MODEL_VERSION_V3)
+    if include_v4: selected_versions.append(MODEL_VERSION_V4)
+    
+    if not selected_versions:
+        logger.warning("No model versions selected, defaulting to v3")
+        include_v3 = True
+        selected_versions.append(MODEL_VERSION_V3)
+        
+    logger.debug(f"Selected model versions: {', '.join(selected_versions)}")
+    
+    # Show release date ranges for selected versions
+    for version in selected_versions:
+        start_date, end_date = VERSION_TO_DATE[version]
+        end_str = end_date if end_date else "present"
+        logger.debug(f"{version} scores: {start_date} to {end_str}")
 
     ctx.obj = {
         'client': Client(
             file_format=file_format,
-            include_v1_scores=include_v1_scores,
-            include_v2_scores=include_v2_scores,
-            include_v3_scores=include_v3_scores,
+            include_v1_scores=include_v1,
+            include_v2_scores=include_v2,
+            include_v3_scores=include_v3,
+            include_v4_scores=include_v4,
             verify_tls=verify_tls,
+            download_speed=download_speed,
         ),
     }
 
@@ -76,6 +110,8 @@ def main(
 @click.option('--output-format', '-f', type=click.Choice(OUTPUT_FORMATS), help='Output format')
 @click.option('--drop-unchanged/--no-drop-unchanged', 'drop_unchanged_scores', default=True, show_default=True, help='Drop unchanged scores')
 @click.option('--download', is_flag=True, help="Don't write to an output file or the console, just download the data")
+@click.option('--no-warning', is_flag=True, help="Skip warning for large downloads")
+@click.option('--verbose', '-v', is_flag=True, help='Enable verbose logging')
 @click.pass_context
 def get_scores_cli(
     ctx: click.Context, 
@@ -86,10 +122,16 @@ def get_scores_cli(
     output_file: Optional[str],
     output_format: Optional[str],
     drop_unchanged_scores: bool,
-    download: bool):
+    download: bool,
+    no_warning: bool,
+    verbose: bool):
     """
     Get scores
     """
+    # Override logging level if verbose flag is specified at subcommand level
+    if verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+        
     if date:
         min_date = date
         max_date = date
@@ -100,6 +142,7 @@ def get_scores_cli(
             workdir=workdir,
             min_date=min_date,
             max_date=max_date,
+            no_warning=no_warning,
         )
     else:
         df = client.get_scores(

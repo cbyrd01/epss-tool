@@ -5,13 +5,19 @@ import io
 import itertools
 import os
 import re
-from typing import Any, Iterable, Iterator, Optional, Tuple, Union
+import time
+from typing import Any, Iterable, Iterator, List, Optional, Tuple, Union
 
 import requests
 from epss import util
 from epss.constants import (
     DEFAULT_FILE_FORMAT, TIME, V1_RELEASE_DATE, V2_RELEASE_DATE, 
-    V3_RELEASE_DATE, V4_RELEASE_DATE, DEFAULT_DOWNLOAD_URL_BASE
+    V3_RELEASE_DATE, V4_RELEASE_DATE, DEFAULT_DOWNLOAD_URL_BASE,
+    MAX_CONCURRENT_DOWNLOADS, DOWNLOAD_RETRY_COUNT, DOWNLOAD_RETRY_DELAY,
+    DOWNLOAD_TIMEOUT, LARGE_DOWNLOAD_THRESHOLD, DOWNLOAD_WARNING_ENABLED,
+    DOWNLOAD_SPEED_CONFIG, DEFAULT_DOWNLOAD_SPEED, DOWNLOAD_SPEEDS,
+    MODEL_VERSION_V1, MODEL_VERSION_V2, MODEL_VERSION_V3, MODEL_VERSION_V4,
+    DEFAULT_MODEL_VERSIONS, VERSION_TO_DATE
 )
 import polars as pl
 import concurrent.futures
@@ -57,17 +63,45 @@ class ClientInterface:
         The dataframe will be sorted by CVE ID in descending order.
         """
         raise NotImplementedError()
+    
+    def download_scores(
+            self,
+            workdir: str,
+            min_date: Optional[TIME] = None,
+            max_date: Optional[TIME] = None,
+            no_warning: bool = False):
+        """
+        Download EPSS scores published between the specified dates.
+        
+        Args:
+            workdir: Directory to download scores to
+            min_date: Minimum date to download scores for (inclusive)
+            max_date: Maximum date to download scores for (inclusive)
+            no_warning: If True, skip warning for large downloads
+        """
+        raise NotImplementedError()
 
 
 @dataclass()
 class BaseClient(ClientInterface):
     file_format: str = DEFAULT_FILE_FORMAT
     verify_tls: bool = True
-    include_v1_scores: bool = False
-    include_v2_scores: bool = False
-    include_v3_scores: bool = True
-    include_v4_scores: bool = False
+    include_v1_scores: bool = MODEL_VERSION_V1 in DEFAULT_MODEL_VERSIONS.split(',')
+    include_v2_scores: bool = MODEL_VERSION_V2 in DEFAULT_MODEL_VERSIONS.split(',')
+    include_v3_scores: bool = MODEL_VERSION_V3 in DEFAULT_MODEL_VERSIONS.split(',')
+    include_v4_scores: bool = MODEL_VERSION_V4 in DEFAULT_MODEL_VERSIONS.split(',')
     download_url_base: str = DEFAULT_DOWNLOAD_URL_BASE
+    download_speed: str = DEFAULT_DOWNLOAD_SPEED
+
+    @property
+    def max_concurrent_downloads(self) -> int:
+        """Returns the maximum number of concurrent downloads based on download speed."""
+        return DOWNLOAD_SPEED_CONFIG[self.download_speed]['max_concurrent']
+    
+    @property
+    def batch_delay(self) -> float:
+        """Returns the delay between download batches based on download speed."""
+        return DOWNLOAD_SPEED_CONFIG[self.download_speed]['batch_delay']
 
     @property
     def min_date(self) -> datetime.date:
@@ -108,21 +142,38 @@ class BaseClient(ClientInterface):
     def get_date_range(self, min_date: Optional[TIME] = None, max_date: Optional[TIME] = None) -> Tuple[datetime.date, datetime.date]:
         """
         Returns a tuple containing the earliest and latest publication dates for EPSS scores under the specified model version constraints.
+        
+        The date range is constrained by:
+        1. The model versions selected (include_v1_scores, include_v2_scores, etc.)
+        2. The explicit min_date and max_date parameters
+        
+        For example:
+        - If include_v1_scores=True and no other versions, dates will be constrained to V1_RELEASE_DATE to V2_RELEASE_DATE-1
+        - If include_v1_scores=True and include_v2_scores=True, dates will be from V1_RELEASE_DATE to V3_RELEASE_DATE-1
+        - If all versions are included (default), dates will be from V1_RELEASE_DATE to the present
         """
         min_allowed_date = self.get_min_date()
         max_allowed_date = self.get_max_date()
-        logger.debug('Detected allowed date range as: %s - %s', min_allowed_date, max_allowed_date)
+        logger.debug('Model version constraints: %s - %s', min_allowed_date, max_allowed_date)
         
-        min_date = util.parse_date(min_date) if min_date else min_allowed_date
-        max_date = util.parse_date(max_date) if max_date else max_allowed_date
+        requested_min = util.parse_date(min_date) if min_date else min_allowed_date
+        requested_max = util.parse_date(max_date) if max_date else max_allowed_date
+        logger.debug('Requested date range: %s - %s', requested_min, requested_max)
 
-        if min_date < min_allowed_date:
-            min_date = min_allowed_date
+        # Adjust dates to be within allowed range
+        final_min_date = max(requested_min, min_allowed_date)
+        final_max_date = min(requested_max, max_allowed_date)
+        
+        if final_min_date != requested_min:
+            logger.info('Min date adjusted from %s to %s (based on model version constraints)', 
+                     requested_min, final_min_date)
+        
+        if final_max_date != requested_max:
+            logger.info('Max date adjusted from %s to %s (based on model version constraints)', 
+                     requested_max, final_max_date)
 
-        if max_date > max_allowed_date:
-            max_date = max_allowed_date
-
-        return min_date, max_date
+        logger.info('Using date range: %s - %s', final_min_date, final_max_date)
+        return final_min_date, final_max_date
     
     def iter_dates(self, min_date: Optional[TIME] = None, max_date: Optional[TIME] = None) -> Iterator[datetime.date]:
         """
@@ -135,38 +186,74 @@ class BaseClient(ClientInterface):
             self,
             workdir: str,
             min_date: Optional[TIME] = None,
-            max_date: Optional[TIME] = None):
+            max_date: Optional[TIME] = None,
+            no_warning: bool = False):
         """
         Download EPSS scores published between the specified dates.
         """
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = {}
-            for date in self.iter_dates(min_date, max_date):
-                path = get_file_path(
-                    workdir=workdir,
-                    file_format=self.file_format,
-                    key=date.isoformat(),
-                )
-                if not os.path.exists(path):
+        min_date, max_date = self.get_date_range(min_date=min_date, max_date=max_date)
+        logger.info('Downloading scores for date range: %s - %s', min_date, max_date)
+        
+        # Collect files that need to be downloaded
+        pending_downloads = []
+        for date in self.iter_dates(min_date, max_date):
+            path = get_file_path(
+                workdir=workdir,
+                file_format=self.file_format,
+                key=date.isoformat(),
+            )
+            if not os.path.exists(path):
+                pending_downloads.append((date, path))
+        
+        if not pending_downloads:
+            logger.debug("All scores have already been downloaded")
+            return
+        
+        # Display warning for large downloads
+        if DOWNLOAD_WARNING_ENABLED and not no_warning and len(pending_downloads) > LARGE_DOWNLOAD_THRESHOLD:
+            logger.warning(
+                f"You're about to download {len(pending_downloads)} files from {DEFAULT_DOWNLOAD_URL_BASE}. "
+                f"This may put significant load on their servers."
+            )
+            if input("Continue? [y/N] ").lower() != 'y':
+                logger.info("Download aborted by user")
+                return
+        
+        logger.info(f"Using download speed '{self.download_speed}': {self.max_concurrent_downloads} concurrent downloads, {self.batch_delay}s delay between batches")
+        
+        # Process in batches for more controlled downloading
+        batches = list(util.iter_chunks(pending_downloads, self.max_concurrent_downloads))
+        total_files = len(pending_downloads)
+        completed = 0
+        
+        for i, batch in enumerate(batches):
+            logger.debug(f"Processing batch {i+1}/{len(batches)} ({len(batch)} files)")
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_concurrent_downloads) as executor:
+                futures = {}
+                for date, path in batch:
                     future = executor.submit(
                         self.download_scores_by_date,
                         workdir=workdir,
                         date=date,
                     )
                     futures[future] = date
-            
-            if futures:
-                total = len(futures)
-                min_date = min(futures.values())
-                max_date = max(futures.values())
-                logger.debug('Downloading scores for %s - %s (%d dates)', min_date.isoformat(), max_date.isoformat(), total)
+                
                 for future in concurrent.futures.as_completed(futures):
                     try:
                         future.result()
-                    except requests.exceptions.HTTPError as e:
+                        completed += 1
+                        if completed % 10 == 0 or completed == total_files:
+                            logger.info('Downloaded %d/%d files', completed, total_files)
+                    except Exception as e:
                         logger.warning('Failed to download scores for %s: %s', futures[future].isoformat(), e)
+            
+            # Apply delay between batches (except for the last batch)
+            if i < len(batches) - 1 and self.batch_delay > 0:
+                logger.debug(f"Waiting {self.batch_delay}s before next batch")
+                time.sleep(self.batch_delay)
          
-            logger.debug("All scores have been downloaded")
+        logger.info("All downloads completed")
 
     def download_scores_by_date(self, workdir: str, date: TIME):
         """
@@ -185,21 +272,42 @@ class BaseClient(ClientInterface):
         url = get_download_url(date, verify_tls=self.verify_tls, download_url_base=self.download_url_base)
         logger.debug('Downloading scores for %s: %s -> %s', date.isoformat(), url, path)
 
-        response = requests.get(url, verify=self.verify_tls, stream=True)
-        response.raise_for_status()
-
-        data = io.BytesIO(response.content)
-
-        if date <= util.parse_date('2022-01-01'):
-            skip_rows = 0
-        else:
-            skip_rows = 1
-
-        df = pl.read_csv(data, skip_rows=skip_rows)
-        df.with_columns(
-            date=date,
-        )
-        util.write_dataframe(df=df, path=path)
+        # Implement retry with exponential backoff
+        retry_count = 0
+        while retry_count <= DOWNLOAD_RETRY_COUNT:
+            try:
+                response = requests.get(url, verify=self.verify_tls, stream=True, timeout=DOWNLOAD_TIMEOUT)
+                response.raise_for_status()
+                
+                data = io.BytesIO(response.content)
+                
+                if date <= util.parse_date('2022-01-01'):
+                    skip_rows = 0
+                else:
+                    skip_rows = 1
+                    
+                df = pl.read_csv(data, skip_rows=skip_rows)
+                df = df.with_columns(
+                    date=date,
+                )
+                util.write_dataframe(df=df, path=path)
+                return
+            except (requests.RequestException, IOError) as e:
+                retry_count += 1
+                if retry_count <= DOWNLOAD_RETRY_COUNT:
+                    # Calculate exponential backoff delay
+                    delay = DOWNLOAD_RETRY_DELAY * (2 ** (retry_count - 1))
+                    logger.warning(
+                        'Failed to download scores for %s (attempt %d/%d): %s. Retrying in %d seconds...', 
+                        date.isoformat(), retry_count, DOWNLOAD_RETRY_COUNT + 1, e, delay
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.error(
+                        'Failed to download scores for %s after %d attempts: %s', 
+                        date.isoformat(), DOWNLOAD_RETRY_COUNT + 1, e
+                    )
+                    raise
 
 
 @dataclass()
@@ -229,14 +337,19 @@ class PolarsClient(BaseClient):
             workdir=workdir,
             query=query,
         )
-        dates = self.iter_dates(min_date, max_date)
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            dfs = executor.map(lambda date: resolver(date=date), dates)
+        dates = list(self.iter_dates(min_date, max_date))
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_concurrent_downloads) as executor:
+            dfs = list(executor.map(lambda date: resolver(date=date), dates))
+            
             if drop_unchanged_scores is False:
                 df = pl.concat(dfs)
             else:
-                first = get_changed_scores(next(dfs), next(dfs))
-                changes = executor.map(lambda e: get_changed_scores(*e), util.iter_pairwise(dfs))
+                if len(dfs) < 2:
+                    return dfs[0] if dfs else pl.DataFrame()
+                    
+                first = get_changed_scores(dfs[0], dfs[1])
+                changes = executor.map(lambda e: get_changed_scores(*e), util.iter_pairwise(dfs[1:]))
 
                 df = pl.concat(itertools.chain([first], changes))
             
@@ -347,24 +460,35 @@ def get_download_url(
 
 
 def get_min_date(
-        include_v1_scores: bool = False, 
-        include_v2_scores: bool = False,
-        include_v3_scores: bool = True,
-        include_v4_scores: bool = False) -> datetime.date:
+        include_v1_scores: bool = MODEL_VERSION_V1 in DEFAULT_MODEL_VERSIONS.split(','), 
+        include_v2_scores: bool = MODEL_VERSION_V2 in DEFAULT_MODEL_VERSIONS.split(','),
+        include_v3_scores: bool = MODEL_VERSION_V3 in DEFAULT_MODEL_VERSIONS.split(','),
+        include_v4_scores: bool = MODEL_VERSION_V4 in DEFAULT_MODEL_VERSIONS.split(',')) -> datetime.date:
     """
     Returns the earliest publication date for EPSS scores under the specified model version constraints.
+    
+    If multiple model versions are enabled, returns the earliest release date among them.
     """
+    # Get the earliest date from all enabled model versions
+    min_dates = []
+    
     if include_v1_scores:
-        return get_epss_v1_min_date()
-    elif include_v2_scores:
-        return get_epss_v2_min_date()
-    elif include_v3_scores:
+        min_dates.append(get_epss_v1_min_date())
+    
+    if include_v2_scores:
+        min_dates.append(get_epss_v2_min_date())
+    
+    if include_v3_scores:
+        min_dates.append(get_epss_v3_min_date())
+    
+    if include_v4_scores:
+        min_dates.append(get_epss_v4_min_date())
+    
+    if not min_dates:
+        logger.warning('No model versions selected. Defaulting to V3.')
         return get_epss_v3_min_date()
-    elif include_v4_scores:
-        return get_epss_v4_min_date()
-    else:
-        logger.warning('Cannot exclude all versions of EPSS scores. Defaulting to EPSS v3.')
-        return get_epss_v3_min_date()
+    
+    return min(min_dates)
 
 
 def get_epss_v1_min_date() -> datetime.date:
@@ -499,26 +623,44 @@ def get_epss_v4_max_date(verify_tls: bool = True, download_url_base: str = DEFAU
 
 
 def get_max_date(
-        include_v1_scores: bool = False,
-        include_v2_scores: bool = False,
-        include_v3_scores: bool = True,
-        include_v4_scores: bool = False,
+        include_v1_scores: bool = MODEL_VERSION_V1 in DEFAULT_MODEL_VERSIONS.split(','),
+        include_v2_scores: bool = MODEL_VERSION_V2 in DEFAULT_MODEL_VERSIONS.split(','),
+        include_v3_scores: bool = MODEL_VERSION_V3 in DEFAULT_MODEL_VERSIONS.split(','),
+        include_v4_scores: bool = MODEL_VERSION_V4 in DEFAULT_MODEL_VERSIONS.split(','),
         verify_tls: bool = True,
         download_url_base: str = DEFAULT_DOWNLOAD_URL_BASE) -> datetime.date:
     """
     Returns the latest publication date for EPSS scores under the specified model version constraints.
+    
+    If multiple model versions are enabled, returns the latest available date among them.
     """
+    # Collect all max dates from enabled model versions
+    max_dates = []
+    
+    if include_v1_scores:
+        # V1 ends right before V2 starts
+        if not include_v2_scores and not include_v3_scores and not include_v4_scores:
+            max_dates.append(get_epss_v1_max_date())
+    
+    if include_v2_scores:
+        # V2 ends right before V3 starts
+        if not include_v3_scores and not include_v4_scores:
+            max_dates.append(get_epss_v2_max_date())
+    
+    if include_v3_scores:
+        # V3 continues to present (or until V4 if not included)
+        if not include_v4_scores:
+            max_dates.append(get_epss_v3_max_date(verify_tls, download_url_base))
+    
     if include_v4_scores:
-        return get_epss_v4_max_date(verify_tls=verify_tls, download_url_base=download_url_base)
-    elif include_v3_scores:
-        return get_epss_v3_max_date(verify_tls=verify_tls, download_url_base=download_url_base)
-    elif include_v2_scores:
-        return get_epss_v2_max_date()
-    elif include_v1_scores:
-        return get_epss_v1_max_date()
-    else:
-        logger.warning('Cannot exclude all versions of EPSS scores. Defaulting to EPSS v3.')
-        return get_epss_v3_max_date(verify_tls=verify_tls, download_url_base=download_url_base)
+        # V4 continues to present
+        max_dates.append(get_epss_v4_max_date(verify_tls, download_url_base))
+    
+    if not max_dates:
+        logger.warning('No model versions selected. Defaulting to V3.')
+        return get_epss_v3_max_date(verify_tls, download_url_base)
+    
+    return max(max_dates)
 
 
 def get_date_range(
