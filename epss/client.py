@@ -15,9 +15,9 @@ from epss.constants import (
     V3_RELEASE_DATE, V4_RELEASE_DATE, DEFAULT_DOWNLOAD_URL_BASE,
     MAX_CONCURRENT_DOWNLOADS, DOWNLOAD_RETRY_COUNT, DOWNLOAD_RETRY_DELAY,
     DOWNLOAD_TIMEOUT, LARGE_DOWNLOAD_THRESHOLD, DOWNLOAD_WARNING_ENABLED,
-    DOWNLOAD_SPEED_CONFIG, DEFAULT_DOWNLOAD_SPEED, DOWNLOAD_SPEEDS,
-    MODEL_VERSION_V1, MODEL_VERSION_V2, MODEL_VERSION_V3, MODEL_VERSION_V4,
-    DEFAULT_MODEL_VERSIONS, VERSION_TO_DATE, EPSS_VERSION
+    CURRENT_DAY_WARNING_ENABLED, DOWNLOAD_SPEED_CONFIG, DEFAULT_DOWNLOAD_SPEED, 
+    DOWNLOAD_SPEEDS, MODEL_VERSION_V1, MODEL_VERSION_V2, MODEL_VERSION_V3, 
+    MODEL_VERSION_V4, DEFAULT_MODEL_VERSIONS, VERSION_TO_DATE, EPSS_VERSION
 )
 import polars as pl
 import concurrent.futures
@@ -69,7 +69,7 @@ class ClientInterface:
             workdir: str,
             min_date: Optional[TIME] = None,
             max_date: Optional[TIME] = None,
-            no_warning: bool = False):
+            no_warnings: bool = False):
         """
         Download EPSS scores published between the specified dates.
         
@@ -77,7 +77,7 @@ class ClientInterface:
             workdir: Directory to download scores to
             min_date: Minimum date to download scores for (inclusive)
             max_date: Maximum date to download scores for (inclusive)
-            no_warning: If True, skip warning for large downloads
+            no_warnings: If True, skip all warnings (large downloads and current day)
         """
         raise NotImplementedError()
 
@@ -187,12 +187,24 @@ class BaseClient(ClientInterface):
             workdir: str,
             min_date: Optional[TIME] = None,
             max_date: Optional[TIME] = None,
-            no_warning: bool = False):
+            no_warnings: bool = False):
         """
         Download EPSS scores published between the specified dates.
         """
         min_date, max_date = self.get_date_range(min_date=min_date, max_date=max_date)
         logger.info('Downloading scores for date range: %s - %s', min_date, max_date)
+        
+        # Check if the date range includes the current day
+        today = datetime.date.today()
+        if CURRENT_DAY_WARNING_ENABLED and not no_warnings and max_date >= today:
+            logger.warning(
+                f"Your selected date range includes today ({today.isoformat()}). "
+                f"EPSS scores for today might not be published yet or might be incomplete. "
+                f"You may want to run this after the daily EPSS file has been posted."
+            )
+            if input("Continue? [y/N] ").lower() != 'y':
+                logger.info("Download aborted by user")
+                return
         
         # Collect files that need to be downloaded
         pending_downloads = []
@@ -210,7 +222,7 @@ class BaseClient(ClientInterface):
             return
         
         # Display warning for large downloads
-        if DOWNLOAD_WARNING_ENABLED and not no_warning and len(pending_downloads) > LARGE_DOWNLOAD_THRESHOLD:
+        if DOWNLOAD_WARNING_ENABLED and not no_warnings and len(pending_downloads) > LARGE_DOWNLOAD_THRESHOLD:
             logger.warning(
                 f"You're about to download {len(pending_downloads)} files from {DEFAULT_DOWNLOAD_URL_BASE}. "
                 f"This may put significant load on their servers."

@@ -111,7 +111,7 @@ def main(
 @click.option('--output-sort', '-s', help='Sort output (e.g., "-epss,+date" where - is descending, + is ascending)')
 @click.option('--drop-unchanged/--no-drop-unchanged', 'drop_unchanged_scores', default=True, show_default=True, help='Drop unchanged scores')
 @click.option('--download', is_flag=True, help="Don't write to an output file or the console, just download the data")
-@click.option('--no-warning', is_flag=True, help="Skip warning for large downloads")
+@click.option('--no-warnings', is_flag=True, help="Skip all warnings (for large downloads and current day data)")
 @click.option('--verbose', '-v', is_flag=True, help='Enable verbose logging')
 @click.pass_context
 def get_scores_cli(
@@ -124,7 +124,7 @@ def get_scores_cli(
     output_sort: Optional[str],
     drop_unchanged_scores: bool,
     download: bool,
-    no_warning: bool,
+    no_warnings: bool,
     verbose: bool):
     """
     Get EPSS scores for CVEs
@@ -150,7 +150,7 @@ def get_scores_cli(
             workdir=workdir,
             min_date=min_date,
             max_date=max_date,
-            no_warning=no_warning,
+            no_warnings=no_warnings,
         )
     else:
         df = client.get_scores(

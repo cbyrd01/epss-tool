@@ -64,6 +64,7 @@ DEFAULT_DOWNLOAD_SPEED = DOWNLOAD_SPEED_NORMAL
 DOWNLOAD_BATCH_DELAY = 0.5     # Seconds to wait between download batches
 LARGE_DOWNLOAD_THRESHOLD = 91  # Number of files that trigger a large download warning
 DOWNLOAD_WARNING_ENABLED = True # Whether to show warning for large downloads
+CURRENT_DAY_WARNING_ENABLED = True # Whether to show warning when downloading data for the current day
 
 # Download speed configurations
 DOWNLOAD_SPEED_CONFIG = {
