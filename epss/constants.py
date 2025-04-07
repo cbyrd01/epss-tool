@@ -26,8 +26,8 @@ MODEL_VERSION_ALL = 'all'
 # Available model versions
 MODEL_VERSIONS = [MODEL_VERSION_V1, MODEL_VERSION_V2, MODEL_VERSION_V3, MODEL_VERSION_V4]
 
-# Default is to include all available versions except the unreleased v4
-DEFAULT_MODEL_VERSIONS = f"{MODEL_VERSION_V1},{MODEL_VERSION_V2},{MODEL_VERSION_V3}"
+# Default is to include all available versions including v4
+DEFAULT_MODEL_VERSIONS = f"{MODEL_VERSION_V1},{MODEL_VERSION_V2},{MODEL_VERSION_V3},{MODEL_VERSION_V4}"
 
 # Version to date mapping
 VERSION_TO_DATE = {

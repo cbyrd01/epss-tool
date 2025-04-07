@@ -25,10 +25,10 @@ def test_version(description, v1=False, v2=False, v3=False, v4=False):
     print(f"Enabled versions: {', '.join(versions)}")
 
 # Test all combinations
-test_version("1. Default (v1, v2, v3)", v1=True, v2=True, v3=True)
+test_version("1. Default (v1, v2, v3, v4)", v1=True, v2=True, v3=True, v4=True)
 test_version("2. Only v1", v1=True)
 test_version("3. Only v2", v2=True)
 test_version("4. Only v3", v3=True)
-test_version("5. v1 and v2", v1=True, v2=True)
-test_version("6. v2 and v3", v2=True, v3=True)
-test_version("7. All versions", v1=True, v2=True, v3=True, v4=True)
+test_version("5. Only v4", v4=True)
+test_version("6. v1 and v2", v1=True, v2=True)
+test_version("7. v3 and v4", v3=True, v4=True)

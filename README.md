@@ -14,19 +14,19 @@ This repository contains a lightning-fast [Python 3 module](epss) and a series o
 - [Easily](examples/get-scores-as-polars-dataframe.py) [switch](examples/get-changed-scores-as-polars-dataframe.py) between different versions<sub>4</sub> of the [EPSS model](https://www.first.org/epss/model)
 - Flexible sorting of results by any column with customizable sort direction
 
-<sub>1. By default, EPSS scores will be downloaded from 2023-03-07 onward, as this is the date when the outputs of EPSS v3 (v2023.03.01) were first published.</sub>
+<sub>1. By default, EPSS scores will be downloaded from all EPSS model versions (v1 through v4), but you can restrict to specific versions using the `--include-versions` option.</sub>
 
 <sub>2. Apache Parquet is the default file format.</sub>
 
 <sub>3. The [Cyentia Institute](https://www.cyentia.com/research/) [publishes](https://www.first.org/epss/data_stats) sets of EPSS scores partitioned by date on a daily basis in GZIP compressed CSV format.</sub>
 
-<sub>4. EPSS has undergone 3 major revisions: [EPSS v1](https://arxiv.org/abs/1908.04856), EPSS v2 (v2022.01.01), and [EPSS v3 (v2023.03.01)](https://arxiv.org/abs/2302.14172) where the first, second, and third revisions all contain major improvements.</sub>
+<sub>4. EPSS has undergone 4 major revisions: [EPSS v1](https://arxiv.org/abs/1908.04856), EPSS v2 (v2022.01.01), [EPSS v3 (v2023.03.01)](https://arxiv.org/abs/2302.14172), and EPSS v4 (v2024.03.14) where each revision contains significant improvements.</sub>
 
 ## Background
 
 The Exploit Prediction Scoring System (EPSS) is a probabilistic [model](https://www.first.org/epss/model) that is designed to predict the likelihood of a given computer security vulnerability being exploited somewhere in the wild within the next 30 days.
 
-The first version of the EPSS model was released in 2021, and it has since undergone two major revisions.
+The first version of the EPSS model was released in 2021, and it has since undergone three major revisions, with the latest v4 model released on March 17, 2025.
 
 The first version of the EPSS model used logistic regression, but subsequent models have used [gradient-boosted decision trees](https://en.wikipedia.org/wiki/Gradient_boosting) ([XGBoost](https://en.wikipedia.org/wiki/XGBoost)) to make predictions.
 
@@ -176,6 +176,12 @@ poetry run epss scores -a 2024-01-01 --drop-unchanged --output-format=jsonl | he
 {"cve":"CVE-2021-43798","epss":0.97105,"percentile":0.99734,"date":"2024-01-03","epss_version":3}
 ```
 
+To view scores from the new v4 model only:
+
+```bash
+poetry run epss --include-versions v4 scores -a 2024-03-17 --drop-unchanged | head
+```
+
 From here, it's easy to see when specific vulnerabilities experienced an increase or decrease in their perceived exploitability:
 
 ```bash
@@ -193,6 +199,7 @@ grep "CVE-2016-0060" | jq -c
 {"cve":"CVE-2016-0060","epss":0.7436,"percentile":0.97832,"date":"2023-12-03","epss_version":3}
 {"cve":"CVE-2016-0060","epss":0.76991,"percentile":0.97928,"date":"2024-01-04","epss_version":3}
 {"cve":"CVE-2016-0060","epss":0.828,"percentile":0.98183,"date":"2024-02-05","epss_version":3}
+{"cve":"CVE-2016-0060","epss":0.85421,"percentile":0.98322,"date":"2024-03-17","epss_version":4}
 ```
 
 #### Sorting results
@@ -264,7 +271,8 @@ WORKDIR = os.path.join(tempfile.gettempdir(), 'epss')
 client = PolarsClient(
     include_v1_scores=False,
     include_v2_scores=False,
-    include_v3_scores=True,
+    include_v3_scores=False,
+    include_v4_scores=True,  # Only include the latest v4 model
 )
 df = client.get_scores(workdir=WORKDIR, drop_unchanged_scores=True)
 print(df)
@@ -286,7 +294,8 @@ WORKDIR = os.path.join(tempfile.gettempdir(), 'epss')
 client = PolarsClient(
     include_v1_scores=False,
     include_v2_scores=False,
-    include_v3_scores=True,
+    include_v3_scores=False,
+    include_v4_scores=True,  # Only use the latest v4 model
 )
 query = Query(
     cve_ids=[

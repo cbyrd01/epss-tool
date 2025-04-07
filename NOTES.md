@@ -8,7 +8,8 @@
 
 - No scores are available before 2021-04-14
 - Output of the EPSS v2 (v2022.01.01) model is available from 2022-02-04 to 2023-03-06
-- Output of the EPSS v3 (v2023-03-01) model is available from 2023-03-07 onward
+- Output of the EPSS v3 (v2023-03-01) model is available from 2023-03-07 to 2025-03-16
+- Output of the EPSS v4 (v2025.03.14) model is available from 2025-03-17 onward
 
 ## Growth in data volume over time
 
@@ -22,7 +23,7 @@
 | 2023-03-01 | 196,574 | 2.36% |
 | 2023-06-01 | 203,872 | 3.71% |
 | 2023-09-01 | 211,071 | 3.53% |
-| 2024-01-01 | 220,901 | 4.66% |    
+| 2024-01-01 | 220,901 | 4.66% |
 
 | Metric | Value |
 | ------ | ----- |

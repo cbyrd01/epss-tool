@@ -44,8 +44,8 @@ def main(
     """
     Exploit Prediction Scoring System (EPSS)
     
-    By default, all available model versions (v1, v2, v3) are included for comprehensive historical data.
-    You can include specific versions using the --include-versions option (e.g. --include-versions v3 or --include-versions v1,v2).
+    By default, all available model versions (v1, v2, v3, v4) are included for comprehensive historical data.
+    You can include specific versions using the --include-versions option (e.g. --include-versions v4 or --include-versions v3,v4).
     """
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(level=level, format='%(asctime)s %(levelname)s %(name)s %(message)s')
@@ -301,7 +301,7 @@ def _output_data(df, format_to_use, output_file=None):
             print(df.write_csv())
         elif format_to_use == JSON:
             print(json.dumps(df.to_dicts(), cls=JSONEncoder))
-        elif output_format == JSONL:
+        elif format_to_use == JSONL:
             for d in df.to_dicts():
                 print(json.dumps(d, cls=JSONEncoder))
         elif format_to_use == PARQUET:
