@@ -6,7 +6,7 @@ import itertools
 import os
 import re
 import time
-from typing import Any, Iterable, Iterator, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 import requests
 from epss import util
@@ -17,7 +17,9 @@ from epss.constants import (
     DOWNLOAD_TIMEOUT, LARGE_DOWNLOAD_THRESHOLD, DOWNLOAD_WARNING_ENABLED,
     CURRENT_DAY_WARNING_ENABLED, DOWNLOAD_SPEED_CONFIG, DEFAULT_DOWNLOAD_SPEED, 
     DOWNLOAD_SPEEDS, MODEL_VERSION_V1, MODEL_VERSION_V2, MODEL_VERSION_V3, 
-    MODEL_VERSION_V4, DEFAULT_MODEL_VERSIONS, VERSION_TO_DATE, EPSS_VERSION
+    MODEL_VERSION_V4, DEFAULT_MODEL_VERSIONS, VERSION_TO_DATE, EPSS_VERSION,
+    DATA_SOURCE_FILE, DATA_SOURCE_API, DATA_SOURCE_FILE_API, DATA_SOURCES,
+    DEFAULT_DATA_SOURCE, API_BASE_URL, API_DEFAULT_LIMIT, API_RATE_LIMITS
 )
 import polars as pl
 import concurrent.futures
@@ -92,12 +94,16 @@ class BaseClient(ClientInterface):
     include_v4_scores: bool = MODEL_VERSION_V4 in DEFAULT_MODEL_VERSIONS.split(',')
     download_url_base: str = DEFAULT_DOWNLOAD_URL_BASE
     download_speed: str = DEFAULT_DOWNLOAD_SPEED
+    data_source: str = DEFAULT_DATA_SOURCE
     missing_dates: List[datetime.date] = None  # Track missing dates
     
     def __post_init__(self):
         if self.missing_dates is None:
             self.missing_dates = []
-
+        
+        if self.data_source not in DATA_SOURCES:
+            raise ValueError(f"Invalid data source: {self.data_source}. Must be one of {DATA_SOURCES}")
+    
     @property
     def max_concurrent_downloads(self) -> int:
         """Returns the maximum number of concurrent downloads based on download speed."""
@@ -309,8 +315,29 @@ class BaseClient(ClientInterface):
             logger.debug("Scores for %s have already been downloaded: %s", date.isoformat(), path)
             return True
         
+        # Determine whether to use file download, API, or try both
+        if self.data_source == DATA_SOURCE_FILE:
+            return self._download_scores_from_file(workdir, date, path)
+        elif self.data_source == DATA_SOURCE_API:
+            return self._download_scores_from_api(workdir, date, path)
+        elif self.data_source == DATA_SOURCE_FILE_API:
+            # Try file download first, fallback to API if it fails
+            result = self._download_scores_from_file(workdir, date, path)
+            if not result:
+                logger.info(f"File download failed for {date.isoformat()}, trying API as fallback")
+                return self._download_scores_from_api(workdir, date, path)
+            return result
+        else:
+            logger.error(f"Invalid data source: {self.data_source}")
+            return False
+    
+    def _download_scores_from_file(self, workdir: str, date: datetime.date, path: str) -> bool:
+        """
+        Download EPSS scores from the file source.
+        Returns True if successful, False if the file is permanently unavailable.
+        """
         url = get_download_url(date, verify_tls=self.verify_tls, download_url_base=self.download_url_base)
-        logger.debug('Downloading scores for %s: %s -> %s', date.isoformat(), url, path)
+        logger.debug('Downloading scores for %s from file source: %s -> %s', date.isoformat(), url, path)
 
         # Implement retry with exponential backoff
         retry_count = 0
@@ -320,10 +347,19 @@ class BaseClient(ClientInterface):
             try:
                 response = requests.get(url, verify=self.verify_tls, stream=True, timeout=DOWNLOAD_TIMEOUT)
                 
-                # For 403/404 errors, we consider these permanent failures after first attempt
-                if response.status_code in (403, 404):
-                    permanent_failure = True
-                    response.raise_for_status()  # This will raise an exception
+                # Handle permanent failure HTTP status codes
+                if response.status_code >= 400:
+                    # Most 4xx/5xx are permanent failures for file downloads
+                    # except for some codes like 429 (Too Many Requests) or 503 (Service Unavailable)
+                    if response.status_code not in (429, 503):
+                        permanent_failure = True
+                        logger.warning(
+                            'Data for %s is unavailable from file source (HTTP %d: %s)', 
+                            date.isoformat(), 
+                            response.status_code,
+                            response.reason
+                        )
+                        return False
                 
                 response.raise_for_status()
                 
@@ -348,32 +384,195 @@ class BaseClient(ClientInterface):
             except (requests.RequestException, IOError) as e:
                 retry_count += 1
                 
-                # Don't retry for permanent failures (like 403/404)
-                if permanent_failure or retry_count > DOWNLOAD_RETRY_COUNT:
-                    if permanent_failure:
+                # Check for HTTP status codes that indicate permanent failure
+                if hasattr(e, 'response') and e.response is not None and e.response.status_code >= 400:
+                    if e.response.status_code not in (429, 503):
+                        # This is a permanent failure, don't retry
+                        permanent_failure = True
                         logger.warning(
-                            'Data for %s is unavailable (received %s). This date will be skipped.', 
+                            'Data for %s is permanently unavailable from file source (HTTP %d: %s)', 
                             date.isoformat(), 
-                            f"{getattr(e.response, 'status_code', 'unknown error')} {getattr(e.response, 'reason', '')}" if hasattr(e, 'response') else str(e)
+                            e.response.status_code,
+                            e.response.reason
                         )
-                    else:
-                        logger.error(
-                            'Failed to download scores for %s after %d attempts: %s', 
-                            date.isoformat(), DOWNLOAD_RETRY_COUNT + 1, e
-                        )
+                        return False
+                
+                # Don't retry for permanent failures or if we've exceeded retry count
+                if permanent_failure or retry_count > DOWNLOAD_RETRY_COUNT:
+                    logger.error(
+                        'Failed to download scores from file source for %s after %d attempts: %s', 
+                        date.isoformat(), retry_count, e
+                    )
                     
-                    # Add to missing dates list if not already there
-                    if date not in self.missing_dates:
-                        self.missing_dates.append(date)
+                    # Don't add to missing dates if we're going to try API fallback
+                    if self.data_source != DATA_SOURCE_FILE_API:
+                        if date not in self.missing_dates:
+                            self.missing_dates.append(date)
                     return False
                 else:
                     # Calculate exponential backoff delay
                     delay = DOWNLOAD_RETRY_DELAY * (2 ** (retry_count - 1))
                     logger.warning(
-                        'Failed to download scores for %s (attempt %d/%d): %s. Retrying in %d seconds...', 
+                        'Failed to download scores from file source for %s (attempt %d/%d): %s. Retrying in %d seconds...', 
                         date.isoformat(), retry_count, DOWNLOAD_RETRY_COUNT + 1, e, delay
                     )
                     time.sleep(delay)
+        
+        # If we've exhausted all retries
+        return False
+
+    def _download_scores_from_api(self, workdir: str, date: datetime.date, path: str) -> bool:
+        """
+        Download EPSS scores from the API source.
+        Returns True if successful, False if API access fails.
+        """
+        logger.debug('Downloading scores for %s from API source', date.isoformat())
+        
+        # Calculate delay between API requests based on download speed
+        request_delay = API_RATE_LIMITS[self.download_speed]['request_delay']
+        
+        try:
+            # Start with offset 0 and continue paginating
+            offset = 0
+            all_records = []
+            total_records = None
+            
+            while total_records is None or offset < total_records:
+                # Wait to respect API rate limits
+                if offset > 0:
+                    time.sleep(request_delay)
+                
+                params = {
+                    'date': date.isoformat(),
+                    'limit': API_DEFAULT_LIMIT,
+                    'offset': offset,
+                    'pretty': 'false',
+                    'envelope': 'true'
+                }
+                
+                # Make API request with appropriate retries
+                api_data = self._make_api_request(params)
+                
+                if not api_data:
+                    logger.error(f"Failed to retrieve data from API for {date.isoformat()}")
+                    if date not in self.missing_dates:
+                        self.missing_dates.append(date)
+                    return False
+                
+                # Extract total record count
+                total_records = api_data.get('total')
+                
+                # Extract data records
+                records = api_data.get('data', [])
+                if not records:
+                    break
+                
+                all_records.extend(records)
+                logger.debug(f"Retrieved {len(records)} records from API (offset {offset}/{total_records})")
+                
+                # Update offset for next page
+                offset += len(records)
+                
+                # If we got fewer records than requested, we're done
+                if len(records) < API_DEFAULT_LIMIT:
+                    break
+            
+            if not all_records:
+                logger.warning(f"No records found in API for {date.isoformat()}")
+                if date not in self.missing_dates:
+                    self.missing_dates.append(date)
+                return False
+            
+            # Convert API data to DataFrame
+            df = pl.DataFrame(all_records)
+            
+            # Add epss_version column
+            epss_version = get_epss_version_for_date(date)
+            df = df.with_columns(
+                epss_version=epss_version,
+                date=date
+            )
+            
+            # Ensure proper column names (API returns 'cve', 'epss', 'percentile', 'date')
+            required_columns = ['cve', 'epss', 'percentile', 'date', 'epss_version']
+            missing_columns = [col for col in required_columns if col not in df.columns]
+            
+            if missing_columns:
+                logger.error(f"API response missing required columns: {missing_columns}")
+                logger.debug(f"Available columns: {df.columns}")
+                return False
+            
+            # Convert column types (API returns strings for numeric values)
+            df = df.with_columns([
+                pl.col('epss').cast(pl.Float64),
+                pl.col('percentile').cast(pl.Float64)
+            ])
+            
+            # Write to file
+            util.write_dataframe(df=df, path=path)
+            logger.info(f"Successfully downloaded {len(df)} EPSS scores from API for {date.isoformat()}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error downloading scores from API for {date.isoformat()}: {str(e)}")
+            if date not in self.missing_dates:
+                self.missing_dates.append(date)
+            return False
+    
+    def _make_api_request(self, params: Dict) -> Optional[Dict]:
+        """
+        Make a request to the EPSS API with retry logic.
+        Returns the parsed JSON response or None if the request failed.
+        """
+        retry_count = 0
+        
+        while retry_count <= DOWNLOAD_RETRY_COUNT:
+            try:
+                response = requests.get(
+                    API_BASE_URL,
+                    params=params,
+                    verify=self.verify_tls,
+                    timeout=DOWNLOAD_TIMEOUT
+                )
+                
+                # Handle permanent failure HTTP status codes 
+                if response.status_code >= 400:
+                    # Most 4xx are permanent failures for API
+                    # except for 429 (Too Many Requests) and some 5xx (Service errors)
+                    if response.status_code < 500 and response.status_code != 429:
+                        logger.warning(
+                            'API request failed with HTTP %d: %s', 
+                            response.status_code,
+                            response.reason
+                        )
+                        return None
+                
+                response.raise_for_status()
+                return response.json()
+            
+            except (requests.RequestException, IOError, ValueError) as e:
+                retry_count += 1
+                
+                # Check for HTTP errors that indicate permanent failures
+                if hasattr(e, 'response') and e.response is not None:
+                    if e.response.status_code < 500 and e.response.status_code != 429:
+                        # Client errors (4xx) other than 429 are permanent
+                        logger.warning(f"API request failed with permanent error: HTTP {e.response.status_code} {e.response.reason}")
+                        return None
+                
+                if retry_count > DOWNLOAD_RETRY_COUNT:
+                    logger.error(f"API request failed after {DOWNLOAD_RETRY_COUNT} retries: {str(e)}")
+                    return None
+                
+                # Calculate exponential backoff delay
+                delay = DOWNLOAD_RETRY_DELAY * (2 ** (retry_count - 1))
+                logger.warning(
+                    f"API request failed (attempt {retry_count}/{DOWNLOAD_RETRY_COUNT + 1}): {str(e)}. "
+                    f"Retrying in {delay} seconds..."
+                )
+                time.sleep(delay)
+        
+        return None
 
 
 @dataclass()
@@ -991,38 +1190,6 @@ def get_date_range(
     return min_date, max_date
 
 
-def get_date_range(verify_tls: bool = True, download_url_base: str = DEFAULT_DOWNLOAD_URL_BASE) -> Tuple[datetime.date, datetime.date]:
-    """
-    Returns a tuple containing the earliest and latest publication dates for EPSS scores.
-    """
-    return get_min_date(), get_max_date(verify_tls=verify_tls, download_url_base=download_url_base)
-
-
-def get_changed_scores(a: pl.DataFrame, b: pl.DataFrame) -> pl.DataFrame:
-    """
-    Given two dataframes, `a` and `b`, this function returns a new dataframe containing only the rows where the `epss` column has changed.
-    
-    The dataframes are expected to have the following columns:
-    - `date`: a date in ISO-8601 format
-    - `cve`: a CVE ID (e.g. CVE-2021-1234)
-    - `epss`: a floating point number representing the EPSS score for the CVE (e.g. 0.1234)
-    """
-    df = pl.concat([a, b])
-    df = df.sort(by=['date', 'cve'])
-    df = df.with_columns(
-        prev_epss=pl.col('epss').shift().over('cve'),
-    )
-    df = df.with_columns(
-        epss_change=pl.col('epss') - pl.col('prev_epss'),
-    )
-    df = df.filter(pl.col('epss_change') != 0)
-    df = df.drop('prev_epss', 'epss_change')
-
-    df = df.sort(by=['cve'], descending=True)
-    df = df.sort(by=['date'], descending=False)
-    return df
-
-
 def read_dataframe(path: str, date: Optional[TIME] = None) -> pl.DataFrame:
     """
     To support transformations over time, it's important to include a `date` column in the dataframe.
@@ -1048,4 +1215,29 @@ def read_dataframe(path: str, date: Optional[TIME] = None) -> pl.DataFrame:
         epss_version = get_epss_version_for_date(first_date)
         df = df.with_columns(epss_version=epss_version)
 
+    return df
+
+
+def get_changed_scores(a: pl.DataFrame, b: pl.DataFrame) -> pl.DataFrame:
+    """
+    Given two dataframes, `a` and `b`, this function returns a new dataframe containing only the rows where the `epss` column has changed.
+    
+    The dataframes are expected to have the following columns:
+    - `date`: a date in ISO-8601 format
+    - `cve`: a CVE ID (e.g. CVE-2021-1234)
+    - `epss`: a floating point number representing the EPSS score for the CVE (e.g. 0.1234)
+    """
+    df = pl.concat([a, b])
+    df = df.sort(by=['date', 'cve'])
+    df = df.with_columns(
+        prev_epss=pl.col('epss').shift().over('cve'),
+    )
+    df = df.with_columns(
+        epss_change=pl.col('epss') - pl.col('prev_epss'),
+    )
+    df = df.filter(pl.col('epss_change') != 0)
+    df = df.drop('prev_epss', 'epss_change')
+
+    df = df.sort(by=['cve'], descending=True)
+    df = df.sort(by=['date'], descending=False)
     return df

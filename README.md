@@ -8,6 +8,7 @@ This repository contains a lightning-fast [Python 3 module](epss) and a series o
 
 - Idempotently download daily sets of EPSS scores<sub>1</sub> in JSON, JSONL, CSV, or [Apache Parquet](https://parquet.apache.org/)<sub>2</sub> format
 - Explore EPSS scores using [Polars](https://pola.rs/), a lightning-fast dataframe library written in Rust
+- Multiple data sources: download from CSV files or query the [FIRST.org EPSS API](https://www.first.org/epss/api)
 - Automatic tracking of EPSS model version via the `epss_version` column (1, 2, 3, or 4)
 - Optionally drop unchanged scores<sub>3</sub>
 - Optionally disable TLS certificate validation when downloading scores (i.e. to support environments where TLS MitM is being performed)
@@ -195,6 +196,30 @@ poetry run epss scores -a 2024-01-01 --output-sort="-date,-epss"
 - `column`: Same as `+column` (ascending order)
 - Multiple columns: Separate by commas (e.g., `-epss,+date`)
 
+#### 6. Data Source Selection
+
+Choose between file-based downloads or the FIRST.org API:
+
+```bash
+# Use the FIRST.org API instead of file downloads
+poetry run epss --data-source=api scores -a 2024-01-01
+
+# Try file downloads first, fall back to API if file download fails
+poetry run epss --data-source=file+api scores -a 2024-01-01
+```
+
+API downloads respect the download speed setting:
+
+```bash
+# Be polite to the API servers
+poetry run epss --data-source=api --download-speed=polite scores -a 2024-01-01
+```
+
+**Data source options:**
+- `file`: Download from CSV files (default)
+- `api`: Use the FIRST.org API exclusively
+- `file+api`: Try file downloads first, use API as a fallback for failures
+
 ### Python API
 
 The EPSS tool can also be used programmatically in your Python code. Additional examples are available in the [examples](examples) folder.
@@ -270,4 +295,30 @@ with Workbook('epss.xlsx') as wb:
         workbook=wb,
         worksheet='CVE Tracking'
     )
+```
+
+#### Example: Using the FIRST.org API with rate limiting
+
+```python
+from epss.client import PolarsClient
+from epss.constants import DATA_SOURCE_API, DOWNLOAD_SPEED_POLITE
+
+import tempfile
+import os
+
+WORKDIR = os.path.join(tempfile.gettempdir(), 'epss')
+
+# Initialize the client with API data source and polite download speed
+client = PolarsClient(
+    data_source=DATA_SOURCE_API,
+    download_speed=DOWNLOAD_SPEED_POLITE
+)
+
+# Get scores from the API
+df = client.get_scores(
+    workdir=WORKDIR,
+    min_date="2024-01-01", 
+    max_date="2024-01-01"
+)
+print(df)
 ```

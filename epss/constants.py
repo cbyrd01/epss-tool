@@ -111,3 +111,30 @@ DEFAULT_SORTING_KEY = DATE_AND_CVE
 
 # How many points to use for floating point precision
 FLOATING_POINT_PRECISION = 5
+
+# Data source options
+DATA_SOURCE_FILE = 'file'
+DATA_SOURCE_API = 'api'
+DATA_SOURCE_FILE_API = 'file+api'
+DATA_SOURCES = [DATA_SOURCE_FILE, DATA_SOURCE_API, DATA_SOURCE_FILE_API]
+DEFAULT_DATA_SOURCE = DATA_SOURCE_FILE
+
+# API configuration
+API_BASE_URL = "https://api.first.org/data/v1/epss"
+API_DEFAULT_LIMIT = 10000  # Increased from 1000 to 10000 (API maximum)
+
+# API rate limits for different download speeds
+API_RATE_LIMITS = {
+    DOWNLOAD_SPEED_POLITE: {
+        'requests_per_minute': 20,
+        'request_delay': 3.0
+    },
+    DOWNLOAD_SPEED_NORMAL: {
+        'requests_per_minute': 60,
+        'request_delay': 1.0
+    },
+    DOWNLOAD_SPEED_FAST: {
+        'requests_per_minute': 120,
+        'request_delay': 0.5
+    }
+}

@@ -32,6 +32,8 @@ DEFAULT_CONSOLE_OUTPUT_FORMAT = TABLE
 @click.option('--verify-tls/--no-verify-tls', default=True, help='Verify TLS certificates when downloading scores')
 @click.option('--download-speed', type=click.Choice(DOWNLOAD_SPEEDS), default=DEFAULT_DOWNLOAD_SPEED, 
               show_default=True, help='Download speed (polite=1 concurrent/1s delay, normal=5 concurrent/0.5s delay, fast=10 concurrent/no delay)')
+@click.option('--data-source', type=click.Choice(DATA_SOURCES), default=DEFAULT_DATA_SOURCE, show_default=True,
+              help='Data source (file=CSV files, api=FIRST.org API, file+api=try file then API if file fails)')
 @click.option('-v', '--verbose', is_flag=True, help='Enable verbose logging')
 @click.pass_context
 def main(
@@ -40,12 +42,16 @@ def main(
     include_versions: str,
     verify_tls: bool,
     download_speed: str,
+    data_source: str,
     verbose: bool):
     """
     Exploit Prediction Scoring System (EPSS)
     
     By default, all available model versions (v1, v2, v3, v4) are included for comprehensive historical data.
     You can include specific versions using the --include-versions option (e.g. --include-versions v4 or --include-versions v3,v4).
+    
+    Data can be retrieved from CSV files (default) or the FIRST.org API. The API is rate-limited, so be considerate
+    with the --download-speed option when using the API.
     """
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(level=level, format='%(asctime)s %(levelname)s %(name)s %(message)s')
@@ -98,6 +104,7 @@ def main(
             include_v4_scores=include_v4,
             verify_tls=verify_tls,
             download_speed=download_speed,
+            data_source=data_source,
         ),
     }
 
